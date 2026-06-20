@@ -1,17 +1,30 @@
 module global_variables
-  implicit none 
+  implicit none
+! Build:
+!   gfortran -std=f95 -O2 tdse.f90 -o tdse
+! Run:
+!   ./tdse < input_tdse
+! Output:
+!   ground_state.log : CG iteration, energy, residual, norm, antisymmetry check
+!   current.dat      : t, A(t), j(t), norm, energy, antisymmetry check
 ! math parameters
-  real(8),parameter :: pi = 4d0*atan(1d0)
+  real(8),parameter :: pi = 3.141592653589793238462643383279502884197d0
   complex(8),parameter :: zi = (0d0, 1d0)
 
-! Physical constants
+! Physical constants (atomic units)
   real(8),parameter :: ev = 1d0/27.2114d0
   real(8),parameter :: fs = 1d0/0.024189d0
   real(8),parameter :: bohr = 0.52917721067d0
 
-! Finite difference parameters
+! Finite difference parameters (4th-order central stencils)
   real(8),parameter :: lc2 = -1d0/12d0, lc1 = 4d0/3d0, lc0 = -5d0/2d0
   real(8),parameter :: gc2 = -1d0/12d0, gc1 = 2d0/3d0
+
+! Numerical parameters kept near the top for easy changes.
+  integer,parameter :: cg_max_iter = 600
+  integer,parameter :: output_stride = 1
+  real(8),parameter :: cg_energy_tol = 1d-11
+  real(8),parameter :: cg_residual_tol = 1d-9
 
   integer :: nx, nt
   real(8) :: dx, dt
@@ -21,10 +34,8 @@ module global_variables
   real(8) :: lattice_constant
   real(8) :: bvc_lattice_constant
 
-
 ! laser parameters
-  real(8) :: E0, omega, Tpulse. phi_CEP
-
+  real(8) :: E0, omega, Tpulse, phi_CEP
 
 ! grids
   real(8), allocatable :: xn(:)
@@ -36,73 +47,122 @@ module global_variables
   real(8), allocatable :: vpot_1d(:), wpot_1d(:)
   real(8), allocatable :: vpot(:,:,:), wpot(:,:,:), tot_pot(:,:,:)
 
-
-end module global
+end module global_variables
 !-------------------------------------------------------
 program main
   use global_variables
   implicit none
+  real(8) :: e0_gs, res_gs, asym_gs
 
+  call initialize
+  call initialize_antisymmetric_state
+  call ground_state_cg(e0_gs, res_gs)
 
+  asym_gs = antisymmetry_error(zpsi)
+  write(*,'(a,1pe16.8)') 'Ground-state energy        = ', e0_gs
+  write(*,'(a,1pe16.8)') 'Ground-state residual norm = ', res_gs
+  write(*,'(a,1pe16.8)') 'Ground-state norm          = ', wavefunction_norm(zpsi)
+  write(*,'(a,1pe16.8)') 'Antisymmetry error         = ', asym_gs
 
+  call propagate_tdse
+  call finalize
 
-
-end program main
+contains
 !-------------------------------------------------------
 subroutine initialize
-  use global_variables
   implicit none
-  integer :: ix
-  
-  call read_input_parameters
 
+  call read_input_parameters
   call set_grids
 
- 
-
-
   allocate(zpsi(0:nx-1, 0:nx-1, 0:nx-1))
-
   allocate(vpot(0:nx-1, 0:nx-1, 0:nx-1))
   allocate(wpot(0:nx-1, 0:nx-1, 0:nx-1))
   allocate(tot_pot(0:nx-1, 0:nx-1, 0:nx-1))
 
-
   call set_potentials
-
 
 end subroutine initialize
 !-------------------------------------------------------
 subroutine read_input_parameters
-  use global_variables
   implicit none
-  real(8) :: Tprop_fs
-  real(8) :: E0_MVm, omega_ev, Tpulse_fs. phi_CEP_2pi
+  real(8) :: Tprop_fs, dt_fs
+  real(8) :: E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi
 
-  read(*,*) lattice_constant, nx
-  read(*,*) Tprop_fs, dt
-  read(*,*) E0_MVm, omega_ev, Tpulse_fs. phi_CEP_2pi
+  call read_real_integer(lattice_constant, nx)
+  call read_two_real_values(Tprop_fs, dt_fs)
+  call read_four_reals(E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi)
 
   Tprop = Tprop_fs*fs
+  dt = dt_fs*fs
+  nt = max(1, nint(Tprop/dt))
+  dt = Tprop/dble(nt)
+
   E0 = E0_MVm*1d6*ev/(bohr*1d10)
   omega = omega_ev*ev
   Tpulse = Tpulse_fs*fs
   phi_CEP = phi_CEP_2pi*2d0*pi
 
-
-  bvc_lattice_constant = lattice_constant*3
-
+  bvc_lattice_constant = lattice_constant*3d0
 
 end subroutine read_input_parameters
 !-------------------------------------------------------
+subroutine read_real_integer(a, n)
+  implicit none
+  real(8),intent(out) :: a
+  integer,intent(out) :: n
+  character(256) :: line
+  integer :: ios
+
+  do
+    read(*,'(a)',iostat=ios) line
+    if (ios /= 0) stop 'Input ended while reading two-value record.'
+    read(line,*,iostat=ios) a, n
+    if (ios == 0) exit
+  end do
+  if (n < 3) stop 'nx must be at least 3.'
+
+end subroutine read_real_integer
+!-------------------------------------------------------
+subroutine read_two_real_values(a, b)
+  implicit none
+  real(8),intent(out) :: a, b
+  character(256) :: line
+  integer :: ios
+
+  do
+    read(*,'(a)',iostat=ios) line
+    if (ios /= 0) stop 'Input ended while reading two-real record.'
+    read(line,*,iostat=ios) a, b
+    if (ios == 0) exit
+  end do
+  if (b <= 0d0) stop 'dt_fs must be positive.'
+
+end subroutine read_two_real_values
+!-------------------------------------------------------
+subroutine read_four_reals(a, b, c, d)
+  implicit none
+  real(8),intent(out) :: a, b, c, d
+  character(256) :: line
+  integer :: ios
+
+! Some old input files contain an unused one-number line before the laser line.
+  do
+    read(*,'(a)',iostat=ios) line
+    if (ios /= 0) stop 'Input ended while reading four-value record.'
+    read(line,*,iostat=ios) a, b, c, d
+    if (ios == 0) exit
+  end do
+  if (c <= 0d0 .and. abs(a) > 0d0) stop 'Tpulse_fs must be positive.'
+
+end subroutine read_four_reals
+!-------------------------------------------------------
 subroutine set_grids
-  use global_variables
   implicit none
   integer :: ix
 
   allocate(xn(0:nx-1))
-  dx = bvc_lattice_constant/nx
-
+  dx = bvc_lattice_constant/dble(nx)
 
   do ix = 0, nx-1
     xn(ix) = ix*dx
@@ -111,10 +171,10 @@ subroutine set_grids
 end subroutine set_grids
 !-------------------------------------------------------
 subroutine set_potentials
-  use global_variables
   implicit none
   integer :: ix1, ix2, ix3
-  real(8) :: x1, x2, x3
+  integer :: id12, id23, id31
+  real(8) :: x1
   real(8),parameter :: v0 = 1d0
   real(8),parameter :: w0 = 1d0
 
@@ -123,31 +183,446 @@ subroutine set_potentials
 
   do ix1 = 0, nx-1
     x1 = xn(ix1)
-    vpot_1d(ix1) = v0*( (cos(pi*x1/lattice_constant))**2 &
-        + 0.25d0*sin(4d0*pi*x1/lattice_constant) )
+    vpot_1d(ix1) = v0*((cos(pi*x1/lattice_constant))**2 &
+        + 0.25d0*sin(4d0*pi*x1/lattice_constant))
   end do
 
+! Pair potential tabulated by the minimum Born-von Karman distance.
+  do ix1 = 0, nx-1
+    x1 = dble(min(ix1, nx-ix1))*dx
+    wpot_1d(ix1) = w0*cos(pi*x1/bvc_lattice_constant)**16
+  end do
 
   do ix1 = 0, nx-1
-    x1 = xn(ix1)
-    wpot_1d(ix1) = w0*cos(pi*x1/bvc_lattice_constant)**16
-  end do    
-
-  do ix1 = 1, nx-1
     do ix2 = 0, nx-1
       do ix3 = 0, nx-1
+        id12 = periodic_distance_index(ix1, ix2)
+        id23 = periodic_distance_index(ix2, ix3)
+        id31 = periodic_distance_index(ix3, ix1)
         vpot(ix1, ix2, ix3) = vpot_1d(ix1) + vpot_1d(ix2) + vpot_1d(ix3)
-        wpot(ix1, ix2, ix3) = wpot_1d(abs(ix1-ix2)) &
-            + wpot_1d(abs(ix2-ix3)) + wpot_1d(abs(ix3-ix1))
+        wpot(ix1, ix2, ix3) = wpot_1d(id12) + wpot_1d(id23) + wpot_1d(id31)
       end do
     end do
   end do
 
   tot_pot = vpot + wpot
 
-
 end subroutine set_potentials
 !-------------------------------------------------------
+integer function periodic_distance_index(i, j)
+  implicit none
+  integer,intent(in) :: i, j
+  integer :: d
+
+  d = abs(i-j)
+  periodic_distance_index = min(d, nx-d)
+
+end function periodic_distance_index
 !-------------------------------------------------------
+integer function ipbc(i)
+  implicit none
+  integer,intent(in) :: i
+
+  ipbc = modulo(i, nx)
+
+end function ipbc
 !-------------------------------------------------------
+subroutine initialize_antisymmetric_state
+  implicit none
+  integer :: ix1, ix2, ix3
+  real(8) :: k(3)
+  complex(8) :: a(3), b(3), c(3)
+
+  k(1) = -2d0*pi/bvc_lattice_constant
+  k(2) = 0d0
+  k(3) =  2d0*pi/bvc_lattice_constant
+
+  do ix1 = 0, nx-1
+    do ix2 = 0, nx-1
+      do ix3 = 0, nx-1
+        a = exp(zi*k*xn(ix1))
+        b = exp(zi*k*xn(ix2))
+        c = exp(zi*k*xn(ix3))
+        zpsi(ix1,ix2,ix3) = determinant3(a, b, c)
+      end do
+    end do
+  end do
+
+  call antisymmetrize(zpsi)
+  call normalize(zpsi)
+
+end subroutine initialize_antisymmetric_state
 !-------------------------------------------------------
+complex(8) function determinant3(a, b, c)
+  implicit none
+  complex(8),intent(in) :: a(3), b(3), c(3)
+
+  determinant3 = a(1)*(b(2)*c(3)-b(3)*c(2)) &
+      - a(2)*(b(1)*c(3)-b(3)*c(1)) &
+      + a(3)*(b(1)*c(2)-b(2)*c(1))
+
+end function determinant3
+!-------------------------------------------------------
+subroutine antisymmetrize(psi)
+  implicit none
+  complex(8),intent(inout) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  integer :: i, j, k
+  complex(8) :: a
+
+  do i = 0, nx-1
+    psi(i,i,:) = (0d0,0d0)
+    psi(i,:,i) = (0d0,0d0)
+    psi(:,i,i) = (0d0,0d0)
+  end do
+
+  do i = 0, nx-3
+    do j = i+1, nx-2
+      do k = j+1, nx-1
+        a = (psi(i,j,k) + psi(j,k,i) + psi(k,i,j) &
+           - psi(j,i,k) - psi(i,k,j) - psi(k,j,i))/6d0
+        psi(i,j,k) =  a
+        psi(j,k,i) =  a
+        psi(k,i,j) =  a
+        psi(j,i,k) = -a
+        psi(i,k,j) = -a
+        psi(k,j,i) = -a
+      end do
+    end do
+  end do
+
+end subroutine antisymmetrize
+!-------------------------------------------------------
+subroutine normalize(psi)
+  implicit none
+  complex(8),intent(inout) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  real(8) :: nrm
+
+  nrm = wavefunction_norm(psi)
+  if (nrm <= 0d0) stop 'Cannot normalize a zero wavefunction.'
+  psi = psi/nrm
+
+end subroutine normalize
+!-------------------------------------------------------
+real(8) function wavefunction_norm(psi)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+
+  wavefunction_norm = sqrt(max(0d0, real(inner_product(psi, psi))))
+
+end function wavefunction_norm
+!-------------------------------------------------------
+complex(8) function inner_product(a, b)
+  implicit none
+  complex(8),intent(in) :: a(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(in) :: b(0:nx-1,0:nx-1,0:nx-1)
+
+  inner_product = sum(conjg(a)*b)*dx**3
+
+end function inner_product
+!-------------------------------------------------------
+subroutine apply_hamiltonian(psi, hpsi, avec)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(out) :: hpsi(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: avec
+  integer :: i, j, k
+  complex(8) :: d2, d1
+
+  do i = 0, nx-1
+    do j = 0, nx-1
+      do k = 0, nx-1
+        d2 = lap_one(psi, i, j, k, 1) + lap_one(psi, i, j, k, 2) &
+           + lap_one(psi, i, j, k, 3)
+        d1 = grad_one(psi, i, j, k, 1) + grad_one(psi, i, j, k, 2) &
+           + grad_one(psi, i, j, k, 3)
+        hpsi(i,j,k) = -0.5d0*d2 - zi*avec*d1 &
+            + (tot_pot(i,j,k) + 1.5d0*avec*avec)*psi(i,j,k)
+      end do
+    end do
+  end do
+
+! The finite-difference Hamiltonian is permutation symmetric; the projection
+! removes round-off drift and exactly zeros Pauli-forbidden diagonal components.
+  call antisymmetrize(hpsi)
+
+end subroutine apply_hamiltonian
+!-------------------------------------------------------
+complex(8) function lap_one(psi, i, j, k, idir)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  integer,intent(in) :: i, j, k, idir
+
+  select case (idir)
+  case (1)
+    lap_one = (lc2*(psi(ipbc(i+2),j,k)+psi(ipbc(i-2),j,k)) &
+        + lc1*(psi(ipbc(i+1),j,k)+psi(ipbc(i-1),j,k)) &
+        + lc0*psi(i,j,k))/dx**2
+  case (2)
+    lap_one = (lc2*(psi(i,ipbc(j+2),k)+psi(i,ipbc(j-2),k)) &
+        + lc1*(psi(i,ipbc(j+1),k)+psi(i,ipbc(j-1),k)) &
+        + lc0*psi(i,j,k))/dx**2
+  case default
+    lap_one = (lc2*(psi(i,j,ipbc(k+2))+psi(i,j,ipbc(k-2))) &
+        + lc1*(psi(i,j,ipbc(k+1))+psi(i,j,ipbc(k-1))) &
+        + lc0*psi(i,j,k))/dx**2
+  end select
+
+end function lap_one
+!-------------------------------------------------------
+complex(8) function grad_one(psi, i, j, k, idir)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  integer,intent(in) :: i, j, k, idir
+
+  select case (idir)
+  case (1)
+    grad_one = (gc2*(psi(ipbc(i+2),j,k)-psi(ipbc(i-2),j,k)) &
+        + gc1*(psi(ipbc(i+1),j,k)-psi(ipbc(i-1),j,k)))/dx
+  case (2)
+    grad_one = (gc2*(psi(i,ipbc(j+2),k)-psi(i,ipbc(j-2),k)) &
+        + gc1*(psi(i,ipbc(j+1),k)-psi(i,ipbc(j-1),k)))/dx
+  case default
+    grad_one = (gc2*(psi(i,j,ipbc(k+2))-psi(i,j,ipbc(k-2))) &
+        + gc1*(psi(i,j,ipbc(k+1))-psi(i,j,ipbc(k-1))))/dx
+  end select
+
+end function grad_one
+!-------------------------------------------------------
+subroutine ground_state_cg(energy, residual_norm)
+  implicit none
+  real(8),intent(out) :: energy, residual_norm
+  complex(8),allocatable :: hpsi(:,:,:), r(:,:,:), p(:,:,:), hp(:,:,:)
+  real(8) :: energy_old, beta, rr, rr_old, pnorm
+  integer :: iter
+
+  allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
+  allocate(r(0:nx-1,0:nx-1,0:nx-1))
+  allocate(p(0:nx-1,0:nx-1,0:nx-1))
+  allocate(hp(0:nx-1,0:nx-1,0:nx-1))
+
+  call normalize(zpsi)
+  call apply_hamiltonian(zpsi, hpsi, 0d0)
+  energy = real(inner_product(zpsi, hpsi))
+  r = hpsi - energy*zpsi
+  call antisymmetrize(r)
+  p = -r
+  rr = real(inner_product(r, r))
+  residual_norm = sqrt(max(0d0, rr))
+  energy_old = energy
+
+  open(20,file='ground_state.log',status='replace')
+  write(20,'(a)') '# iter energy residual_norm norm antisymmetry_error'
+  write(20,'(i8,4(1x,1pe20.12))') 0, energy, residual_norm, &
+      wavefunction_norm(zpsi), antisymmetry_error(zpsi)
+
+  do iter = 1, cg_max_iter
+    p = p - zpsi*inner_product(zpsi, p)
+    call antisymmetrize(p)
+    pnorm = wavefunction_norm(p)
+    if (pnorm < 1d-14) exit
+    p = p/pnorm
+
+    call apply_hamiltonian(p, hp, 0d0)
+    call rayleigh_ritz_update(zpsi, p, hpsi, hp, energy)
+    call normalize(zpsi)
+
+    call apply_hamiltonian(zpsi, hpsi, 0d0)
+    energy = real(inner_product(zpsi, hpsi))
+    r = hpsi - energy*zpsi
+    call antisymmetrize(r)
+
+    rr_old = rr
+    rr = real(inner_product(r, r))
+    residual_norm = sqrt(max(0d0, rr))
+    write(20,'(i8,4(1x,1pe20.12))') iter, energy, residual_norm, &
+        wavefunction_norm(zpsi), antisymmetry_error(zpsi)
+
+    if (abs(energy-energy_old) < cg_energy_tol .or. &
+        residual_norm < cg_residual_tol) exit
+
+    beta = max(0d0, rr/max(rr_old, 1d-300))
+    p = -r + beta*p
+    energy_old = energy
+  end do
+
+  close(20)
+  deallocate(hpsi, r, p, hp)
+
+end subroutine ground_state_cg
+!-------------------------------------------------------
+subroutine rayleigh_ritz_update(psi, p, hpsi, hp, energy)
+  implicit none
+  complex(8),intent(inout) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(in) :: p(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(in) :: hpsi(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(in) :: hp(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(out) :: energy
+  real(8) :: a, c, delta, lambda
+  complex(8) :: b, ratio
+
+  a = real(inner_product(psi, hpsi))
+  c = real(inner_product(p, hp))
+  b = inner_product(psi, hp)
+  delta = sqrt((a-c)**2 + 4d0*abs(b)**2)
+  lambda = 0.5d0*(a + c - delta)
+
+  if (abs(b) > 1d-300) then
+    ratio = -(a-lambda)/b
+    psi = psi + ratio*p
+  else if (c < a) then
+    psi = p
+  end if
+
+  call antisymmetrize(psi)
+  energy = lambda
+
+end subroutine rayleigh_ritz_update
+!-------------------------------------------------------
+subroutine propagate_tdse
+  implicit none
+  integer :: it
+  real(8) :: t, avec, curr, en, nrm, asym
+  complex(8),allocatable :: hpsi(:,:,:)
+
+  allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
+  open(30,file='current.dat',status='replace')
+  write(30,'(a)') '# t_au A_t current norm energy antisymmetry_error'
+
+  do it = 0, nt
+    t = dble(it)*dt
+    avec = vector_potential(t)
+    call apply_hamiltonian(zpsi, hpsi, avec)
+    en = real(inner_product(zpsi, hpsi))
+    curr = total_current(zpsi, avec)
+    nrm = wavefunction_norm(zpsi)
+    asym = antisymmetry_error(zpsi)
+
+    if (mod(it, output_stride) == 0) then
+      write(30,'(6(1x,1pe20.12))') t, avec, curr, nrm, en, asym
+    end if
+
+    if (it < nt) call rk4_step(t, dt)
+  end do
+
+  close(30)
+  deallocate(hpsi)
+
+end subroutine propagate_tdse
+!-------------------------------------------------------
+subroutine rk4_step(t, h)
+  implicit none
+  real(8),intent(in) :: t, h
+  complex(8),allocatable :: y0(:,:,:), yt(:,:,:), k1(:,:,:), k2(:,:,:)
+  complex(8),allocatable :: k3(:,:,:), k4(:,:,:)
+
+  allocate(y0(0:nx-1,0:nx-1,0:nx-1))
+  allocate(yt(0:nx-1,0:nx-1,0:nx-1))
+  allocate(k1(0:nx-1,0:nx-1,0:nx-1))
+  allocate(k2(0:nx-1,0:nx-1,0:nx-1))
+  allocate(k3(0:nx-1,0:nx-1,0:nx-1))
+  allocate(k4(0:nx-1,0:nx-1,0:nx-1))
+
+  y0 = zpsi
+  call tdse_rhs(y0, k1, t)
+  yt = y0 + 0.5d0*h*k1
+  call antisymmetrize(yt)
+  call tdse_rhs(yt, k2, t+0.5d0*h)
+  yt = y0 + 0.5d0*h*k2
+  call antisymmetrize(yt)
+  call tdse_rhs(yt, k3, t+0.5d0*h)
+  yt = y0 + h*k3
+  call antisymmetrize(yt)
+  call tdse_rhs(yt, k4, t+h)
+
+  zpsi = y0 + h*(k1 + 2d0*k2 + 2d0*k3 + k4)/6d0
+  call antisymmetrize(zpsi)
+  call normalize(zpsi)
+
+  deallocate(y0, yt, k1, k2, k3, k4)
+
+end subroutine rk4_step
+!-------------------------------------------------------
+subroutine tdse_rhs(psi, rhs, t)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(out) :: rhs(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: t
+
+  call apply_hamiltonian(psi, rhs, vector_potential(t))
+  rhs = -zi*rhs
+
+end subroutine tdse_rhs
+!-------------------------------------------------------
+real(8) function vector_potential(t)
+  implicit none
+  real(8),intent(in) :: t
+  real(8) :: env
+
+  if (abs(E0) <= tiny(E0) .or. abs(omega) <= tiny(omega) .or. &
+      t < 0d0 .or. t > Tpulse) then
+    vector_potential = 0d0
+  else
+    env = sin(pi*t/Tpulse)**2
+! A(t) is chosen so that the field is approximately E(t)=-dA/dt for a
+! slowly varying envelope; the exact A(t) is what enters the Hamiltonian.
+    vector_potential = -(E0/omega)*env*sin(omega*t + phi_CEP)
+  end if
+
+end function vector_potential
+!-------------------------------------------------------
+real(8) function total_current(psi, avec)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: avec
+  integer :: i, j, k
+  complex(8) :: gsum, pexp
+
+  pexp = (0d0,0d0)
+  do i = 0, nx-1
+    do j = 0, nx-1
+      do k = 0, nx-1
+        gsum = grad_one(psi, i, j, k, 1) + grad_one(psi, i, j, k, 2) &
+             + grad_one(psi, i, j, k, 3)
+        pexp = pexp + conjg(psi(i,j,k))*(-zi*gsum)*dx**3
+      end do
+    end do
+  end do
+
+  total_current = real(pexp) + 3d0*avec*real(inner_product(psi, psi))
+
+end function total_current
+!-------------------------------------------------------
+real(8) function antisymmetry_error(psi)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  integer :: i, j, k
+  real(8) :: err
+
+  err = 0d0
+  do i = 0, nx-1
+    do j = 0, nx-1
+      do k = 0, nx-1
+        err = max(err, abs(psi(i,j,k) + psi(j,i,k)))
+        err = max(err, abs(psi(i,j,k) + psi(i,k,j)))
+        err = max(err, abs(psi(i,j,k) + psi(k,j,i)))
+      end do
+    end do
+  end do
+  antisymmetry_error = err
+
+end function antisymmetry_error
+!-------------------------------------------------------
+subroutine finalize
+  implicit none
+
+  if (allocated(xn)) deallocate(xn)
+  if (allocated(zpsi)) deallocate(zpsi)
+  if (allocated(vpot_1d)) deallocate(vpot_1d)
+  if (allocated(wpot_1d)) deallocate(wpot_1d)
+  if (allocated(vpot)) deallocate(vpot)
+  if (allocated(wpot)) deallocate(wpot)
+  if (allocated(tot_pot)) deallocate(tot_pot)
+
+end subroutine finalize
+!-------------------------------------------------------
+end program main
