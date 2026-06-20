@@ -1,0 +1,21 @@
+# Log files
+*.out
+*.log
+*~
+
+# Object files
+*.o
+
+# Module files
+*.mod
+
+# Executable files
+ARTED_noc
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+
