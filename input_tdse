@@ -1,0 +1,4 @@
+10.26 60  ! lattice_constant, nx
+40 0.01    ! Tprop_fs, dt   
+0.0    ! 
+0.1d0  1.55  20.0  0.0  ! E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi
