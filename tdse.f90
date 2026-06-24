@@ -83,6 +83,7 @@ subroutine initialize
   allocate(tot_pot(0:nx-1, 0:nx-1, 0:nx-1))
 
   call set_potentials
+  call check_time_step
 
 end subroutine initialize
 !-------------------------------------------------------
@@ -122,7 +123,7 @@ subroutine read_real_integer(a, n)
     read(line,*,iostat=ios) a, n
     if (ios == 0) exit
   end do
-  if (n < 3) stop 'nx must be at least 3.'
+  if (n < 5) stop 'nx must be at least 5 for the fourth-order stencil.'
 
 end subroutine read_real_integer
 !-------------------------------------------------------
@@ -210,6 +211,20 @@ subroutine set_potentials
   tot_pot = vpot + wpot
 
 end subroutine set_potentials
+!-------------------------------------------------------
+subroutine check_time_step
+  implicit none
+  real(8) :: hmax_est
+
+! For the fourth-order Laplacian, the largest one-particle kinetic eigenvalue
+! is 8/(3 dx**2); three particles give 8/dx**2 before adding potentials.
+  hmax_est = 8d0/dx**2 + maxval(abs(tot_pot))
+  if (dt*hmax_est > 2.5d0) then
+    write(*,'(a,1pe12.4,a)') 'Warning: RK4 time step may be unstable; dt*Hmax ~= ', &
+        dt*hmax_est, '.'
+  end if
+
+end subroutine check_time_step
 !-------------------------------------------------------
 integer function periodic_distance_index(i, j)
   implicit none
@@ -434,8 +449,9 @@ subroutine ground_state_cg(energy, residual_norm)
     write(20,'(i8,4(1x,1pe20.12))') iter, energy, residual_norm, &
         wavefunction_norm(zpsi), antisymmetry_error(zpsi)
 
-    if (abs(energy-energy_old) < cg_energy_tol .or. &
-        residual_norm < cg_residual_tol) exit
+    if (residual_norm < cg_residual_tol) exit
+    if (abs(energy-energy_old) < cg_energy_tol .and. &
+        residual_norm < 100d0*cg_residual_tol) exit
 
     beta = max(0d0, rr/max(rr_old, 1d-300))
     p = -r + beta*p
@@ -478,30 +494,37 @@ end subroutine rayleigh_ritz_update
 subroutine propagate_tdse
   implicit none
   integer :: it
-  real(8) :: t, avec, curr, en, nrm, asym
+  real(8) :: t, avec
   complex(8),allocatable :: hpsi(:,:,:)
+! physics
+  real(8),allocatable :: current_t(:), energy_t(:), norm_t(:)
+
+  allocate(current_t(0:nt))
+  allocate(energy_t(0:nt))
+  allocate(norm_t(0:nt))
 
   allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
-  open(30,file='current.dat',status='replace')
-  write(30,'(a)') '# t_au A_t current norm energy antisymmetry_error'
+
 
   do it = 0, nt
     t = dble(it)*dt
     avec = vector_potential(t)
     call apply_hamiltonian(zpsi, hpsi, avec)
-    en = real(inner_product(zpsi, hpsi))
-    curr = total_current(zpsi, avec)
-    nrm = wavefunction_norm(zpsi)
-    asym = antisymmetry_error(zpsi)
-
-    if (mod(it, output_stride) == 0) then
-      write(30,'(6(1x,1pe20.12))') t, avec, curr, nrm, en, asym
-    end if
+    energy_t(it)  = real(inner_product(zpsi, hpsi))
+    current_t(it) = total_current(zpsi, avec)
+    norm_t(it)    = wavefunction_norm(zpsi)
 
     if (it < nt) call rk4_step(t, dt)
   end do
 
+  open(30,file='current.dat',status='replace')
+  do it = 0, nt
+    t = dble(it)*dt
+    write(30,"(999e26.16e)")t, vector_potential(t), current_t(it), &
+        norm_t(it), energy_t(it)
+  end do
   close(30)
+
   deallocate(hpsi)
 
 end subroutine propagate_tdse
@@ -533,7 +556,6 @@ subroutine rk4_step(t, h)
 
   zpsi = y0 + h*(k1 + 2d0*k2 + 2d0*k3 + k4)/6d0
   call antisymmetrize(zpsi)
-  call normalize(zpsi)
 
   deallocate(y0, yt, k1, k2, k3, k4)
 
@@ -588,6 +610,27 @@ real(8) function total_current(psi, avec)
   total_current = real(pexp) + 3d0*avec*real(inner_product(psi, psi))
 
 end function total_current
+!-------------------------------------------------------
+complex(8) function grad_one(psi, i, j, k, idir)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  integer,intent(in) :: i, j, k, idir
+
+  select case (idir)
+  case (1)
+    grad_one = (gc1*(psi(ipbc(i+1),j,k) - psi(ipbc(i-1),j,k)) &
+        + gc2*(psi(ipbc(i+2),j,k) - psi(ipbc(i-2),j,k)))/dx
+  case (2)
+    grad_one = (gc1*(psi(i,ipbc(j+1),k) - psi(i,ipbc(j-1),k)) &
+        + gc2*(psi(i,ipbc(j+2),k) - psi(i,ipbc(j-2),k)))/dx
+  case (3)
+    grad_one = (gc1*(psi(i,j,ipbc(k+1)) - psi(i,j,ipbc(k-1))) &
+        + gc2*(psi(i,j,ipbc(k+2)) - psi(i,j,ipbc(k-2))))/dx
+  case default
+    stop 'grad_one: invalid coordinate direction.'
+  end select
+
+end function grad_one
 !-------------------------------------------------------
 real(8) function antisymmetry_error(psi)
   implicit none
