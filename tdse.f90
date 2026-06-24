@@ -30,7 +30,9 @@ module global_variables
   real(8) :: dx, dt
   real(8) :: Tprop
 
-! material parameters
+
+
+! Material parameters
   real(8) :: lattice_constant
   real(8) :: bvc_lattice_constant
 
@@ -325,68 +327,60 @@ subroutine apply_hamiltonian(psi, hpsi, avec)
   complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
   complex(8),intent(out) :: hpsi(0:nx-1,0:nx-1,0:nx-1)
   real(8),intent(in) :: avec
-  integer :: i, j, k
-  complex(8) :: d2, d1
+  integer :: ix1, ix2, ix3
+  integer :: ix1p1, ix2p1, ix3p1
+  integer :: ix1p2, ix2p2, ix3p2
+  integer :: ix1m1, ix2m1, ix3m1
+  integer :: ix1m2, ix2m2, ix3m2
+  complex(8) :: zc_0, zc_p1, zc_p2, zc_m1, zc_m2
 
-  do i = 0, nx-1
-    do j = 0, nx-1
-      do k = 0, nx-1
-        d2 = lap_one(psi, i, j, k, 1) + lap_one(psi, i, j, k, 2) &
-           + lap_one(psi, i, j, k, 3)
-        d1 = grad_one(psi, i, j, k, 1) + grad_one(psi, i, j, k, 2) &
-           + grad_one(psi, i, j, k, 3)
-        hpsi(i,j,k) = -0.5d0*d2 - zi*avec*d1 &
-            + (tot_pot(i,j,k) + 1.5d0*avec*avec)*psi(i,j,k)
+
+  zc_0  = 3d0*(-0.5d0*lc0/dx**2 + 0.5d0*avec**2)
+  zc_p1 = -0.5d0*lc1/dx**2 - zi*gc1*avec/dx
+  zc_p2 = -0.5d0*lc2/dx**2 - zi*gc2*avec/dx
+  zc_m1 = -0.5d0*lc1/dx**2 + zi*gc1*avec/dx
+  zc_m2 = -0.5d0*lc2/dx**2 + zi*gc2*avec/dx
+
+  do ix1 = 0, nx-1
+
+    ix1p1 = ipbc(ix1+1)
+    ix1p2 = ipbc(ix1+2)
+    ix1m1 = ipbc(ix1-1)
+    ix1m2 = ipbc(ix1-2)
+
+    do ix2 = 0, nx-1
+
+      ix2p1 = ipbc(ix2+1)
+      ix2p2 = ipbc(ix2+2)
+      ix2m1 = ipbc(ix2-1)
+      ix2m2 = ipbc(ix2-2)
+
+      do ix3 = 0, nx-1
+        
+        ix3p1 = ipbc(ix3+1)
+        ix3p2 = ipbc(ix3+2)
+        ix3m1 = ipbc(ix3-1)
+        ix3m2 = ipbc(ix3-2)
+
+        
+        hpsi(ix1,ix2,ix3) = (zc_0+tot_pot(ix1, ix2, ix3))*psi(ix1,ix2,ix3) &
+            + zc_p1*(psi(ix1p1,ix2,ix3) + psi(ix1,ix2p1,ix3) &
+            + psi(ix1,ix2,ix3p1)) &
+            + zc_m1*(psi(ix1m1,ix2,ix3) + psi(ix1,ix2m1,ix3) &
+            + psi(ix1,ix2,ix3m1)) &
+            + zc_p2*(psi(ix1p2,ix2,ix3) + psi(ix1,ix2p2,ix3) &
+            + psi(ix1,ix2,ix3p2)) &
+            + zc_m2*(psi(ix1m2,ix2,ix3) + psi(ix1,ix2m2,ix3) &
+            + psi(ix1,ix2,ix3m2))
+        
       end do
     end do
   end do
-
 ! The finite-difference Hamiltonian is permutation symmetric; the projection
 ! removes round-off drift and exactly zeros Pauli-forbidden diagonal components.
-  call antisymmetrize(hpsi)
+!  call antisymmetrize(hpsi)
 
 end subroutine apply_hamiltonian
-!-------------------------------------------------------
-complex(8) function lap_one(psi, i, j, k, idir)
-  implicit none
-  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
-  integer,intent(in) :: i, j, k, idir
-
-  select case (idir)
-  case (1)
-    lap_one = (lc2*(psi(ipbc(i+2),j,k)+psi(ipbc(i-2),j,k)) &
-        + lc1*(psi(ipbc(i+1),j,k)+psi(ipbc(i-1),j,k)) &
-        + lc0*psi(i,j,k))/dx**2
-  case (2)
-    lap_one = (lc2*(psi(i,ipbc(j+2),k)+psi(i,ipbc(j-2),k)) &
-        + lc1*(psi(i,ipbc(j+1),k)+psi(i,ipbc(j-1),k)) &
-        + lc0*psi(i,j,k))/dx**2
-  case default
-    lap_one = (lc2*(psi(i,j,ipbc(k+2))+psi(i,j,ipbc(k-2))) &
-        + lc1*(psi(i,j,ipbc(k+1))+psi(i,j,ipbc(k-1))) &
-        + lc0*psi(i,j,k))/dx**2
-  end select
-
-end function lap_one
-!-------------------------------------------------------
-complex(8) function grad_one(psi, i, j, k, idir)
-  implicit none
-  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
-  integer,intent(in) :: i, j, k, idir
-
-  select case (idir)
-  case (1)
-    grad_one = (gc2*(psi(ipbc(i+2),j,k)-psi(ipbc(i-2),j,k)) &
-        + gc1*(psi(ipbc(i+1),j,k)-psi(ipbc(i-1),j,k)))/dx
-  case (2)
-    grad_one = (gc2*(psi(i,ipbc(j+2),k)-psi(i,ipbc(j-2),k)) &
-        + gc1*(psi(i,ipbc(j+1),k)-psi(i,ipbc(j-1),k)))/dx
-  case default
-    grad_one = (gc2*(psi(i,j,ipbc(k+2))-psi(i,j,ipbc(k-2))) &
-        + gc1*(psi(i,j,ipbc(k+1))-psi(i,j,ipbc(k-1))))/dx
-  end select
-
-end function grad_one
 !-------------------------------------------------------
 subroutine ground_state_cg(energy, residual_norm)
   implicit none
@@ -400,6 +394,7 @@ subroutine ground_state_cg(energy, residual_norm)
   allocate(p(0:nx-1,0:nx-1,0:nx-1))
   allocate(hp(0:nx-1,0:nx-1,0:nx-1))
 
+  call antisymmetrize(zpsi)
   call normalize(zpsi)
   call apply_hamiltonian(zpsi, hpsi, 0d0)
   energy = real(inner_product(zpsi, hpsi))
@@ -424,9 +419,11 @@ subroutine ground_state_cg(energy, residual_norm)
 
     call apply_hamiltonian(p, hp, 0d0)
     call rayleigh_ritz_update(zpsi, p, hpsi, hp, energy)
+    call antisymmetrize(zpsi)
     call normalize(zpsi)
 
     call apply_hamiltonian(zpsi, hpsi, 0d0)
+    call antisymmetrize(hpsi)
     energy = real(inner_product(zpsi, hpsi))
     r = hpsi - energy*zpsi
     call antisymmetrize(r)
