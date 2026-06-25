@@ -112,7 +112,7 @@ subroutine read_input_parameters
   write(*,*)'dt (refined) = ', dt
   write(*,*)'nt = ', nt
 
-  E0 = E0_MVm*1d6*ev/(bohr*1d10)
+  E0 = E0_MVm*1d-6*ev/(bohr*1d-10)
   omega = omega_ev*ev
   Tpulse = Tpulse_fs*fs
   phi_CEP = phi_CEP_2pi*2d0*pi
@@ -634,7 +634,7 @@ real(8) function total_current(psi, avec)
             + psi(ix1,ix2,ix3p2)) &
             + zc_m2*(psi(ix1m2,ix2,ix3) + psi(ix1,ix2m2,ix3) &
             + psi(ix1,ix2,ix3m2)))) &
-            + avec*abs(psi(ix1,ix2,ix3))**2
+            + 3d0*avec*abs(psi(ix1,ix2,ix3))**2
       end do
     end do
   end do
