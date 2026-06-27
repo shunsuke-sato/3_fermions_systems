@@ -139,7 +139,7 @@ subroutine set_potentials
   integer :: ix1, ix2, ix3
   integer :: id12, id23, id31
   real(8) :: x1
-  real(8),parameter :: v0 = 1d0
+  real(8),parameter :: v0 = 0.11813d0
   real(8),parameter :: w0 = 1d0*0d0
 
   allocate(vpot_1d(0:nx-1))

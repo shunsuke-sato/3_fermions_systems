@@ -22,7 +22,7 @@ module global_variables
 
 ! Numerical parameters kept near the top for easy changes.
   integer,parameter :: nocc = 3
-  integer,parameter :: hf_max_iter = 2000
+  integer,parameter :: hf_max_iter = 4000
   integer,parameter :: hf_output_stride = 20
   integer,parameter :: output_stride = 1
   real(8),parameter :: hf_energy_tol = 1d-11
@@ -134,8 +134,8 @@ subroutine set_potentials
   implicit none
   integer :: ix1
   real(8) :: x1
-  real(8),parameter :: v0 = 1d0
-  real(8),parameter :: w0 = 1d0*0d0
+  real(8),parameter :: v0 = 0.11813d0
+  real(8),parameter :: w0 = 0.01d0
 
   allocate(vpot_1d(0:nx-1))
   allocate(wpot_1d(0:nx-1))
