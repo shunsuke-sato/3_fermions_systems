@@ -6,7 +6,12 @@ module global_variables
 !   ./tdse < input_tdse
 ! Output:
 !   ground_state.log : CG iteration, energy, residual, norm, antisymmetry check
-!   current.dat      : t, A(t), j(t), norm, energy, antisymmetry check
+!   eigenstates.log  : convergence data for all computed eigenstates
+!   eigenstate_currents.out : field-free particle velocity and charge current
+!   current.out      : total single-run current, norm, and energy versus time
+!   state_populations.out : raw projections and norm-corrected populations
+! A single-run current contains all response orders; it is not, by itself, the
+! shift current.  An even-in-field component requires separate +E0 and -E0 runs.
 ! math parameters
   real(8),parameter :: pi = 3.141592653589793238462643383279502884197d0
   complex(8),parameter :: zi = (0d0, 1d0)
@@ -15,6 +20,8 @@ module global_variables
   real(8),parameter :: ev = 1d0/27.2114d0
   real(8),parameter :: fs = 1d0/0.024189d0
   real(8),parameter :: bohr = 0.52917721067d0
+! Atomic unit of electric field in V/m (CODATA value used for input conversion).
+  real(8),parameter :: electric_field_au_Vpm = 5.14220674763d11
 
 ! Finite difference parameters (4th-order central stencils)
   real(8),parameter :: lc2 = -1d0/12d0, lc1 = 4d0/3d0, lc0 = -5d0/2d0
@@ -36,6 +43,9 @@ module global_variables
 ! Material parameters
   real(8) :: lattice_constant
   real(8) :: bvc_lattice_constant
+! Pair-interaction strength.  The default w0=0 is the intentional
+! noninteracting baseline; change this module variable for interacting studies.
+  real(8) :: w0 = 0d0
 
 ! laser parameters
   real(8) :: E0, omega, Tpulse, phi_CEP
@@ -74,6 +84,8 @@ program main
   write(*,'(a,1pe16.8)') 'Ground-state norm          = ', wavefunction_norm(zpsi)
   write(*,'(a,1pe16.8)') 'Antisymmetry error         = ', asym_gs
 
+  call check_current_operator(zpsi)
+
   call propagate_tdse
   call finalize
 
@@ -107,28 +119,52 @@ subroutine read_input_parameters
   read(*,*)Tprop_fs, dt
   read(*,*)E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi
 
-  write(*,*)'lattice_constant = ', lattice_constant
+! Input units are intentionally mixed for backward compatibility:
+! lattice_constant and dt are in atomic units (bohr and atomic time), while
+! Tprop_fs/Tpulse_fs are fs, E0_MVm is MV/m, and omega_ev is eV.
+  if (lattice_constant <= 0d0) stop 'lattice_constant must be > 0 bohr.'
+  if (nx < 5) stop 'nx must be >= 5 for the fourth-order finite differences.'
+  if (dt <= 0d0) stop 'dt must be > 0 atomic units of time.'
+  if (Tprop_fs <= 0d0) stop 'Tprop_fs must be > 0 fs.'
+  if (Tpulse_fs <= 0d0) stop 'Tpulse_fs must be > 0 fs.'
+  if (omega_ev <= 0d0) stop 'omega_ev must be > 0 eV.'
+
+  write(*,'(a)') 'Input-unit convention: lattice_constant [bohr], nx [grid points]'
+  write(*,'(a)') '  Tprop_fs/Tpulse_fs [fs], dt [a.u. time], E0_MVm [MV/m],'
+  write(*,'(a)') '  omega_ev [eV], phi_CEP_2pi [cycles].'
+  write(*,*)'lattice_constant [bohr] = ', lattice_constant
   write(*,*)'nx = ', nx
   write(*,*)'Tprop_fs = ', Tprop_fs
-  write(*,*)'dt = ', dt
+  write(*,*)'requested dt [a.u. time] = ', dt
   write(*,*)'E0_MVm = ', E0_MVm
   write(*,*)'omega_ev = ', omega_ev
   write(*,*)'Tpulse_fs = ', Tpulse_fs
   write(*,*)'phi_CEP_2pi = ', phi_CEP_2pi
-
-
   Tprop = Tprop_fs*fs
-  nt = max(1, nint(Tprop/dt))+1
+  nt = max(1, nint(Tprop/dt))
   dt = Tprop/dble(nt)
-  write(*,*)'dt (refined) = ', dt
-  write(*,*)'nt = ', nt
+  write(*,*)'refined dt [a.u. time] = ', dt
+  write(*,*)'number of time steps nt = ', nt
+  write(*,*)'Tprop and nt*dt [a.u. time] = ', Tprop, dble(nt)*dt
 
-  E0 = E0_MVm*1d-6*ev/(bohr*1d-10)
+  E0 = E0_MVm*1d6/electric_field_au_Vpm
   omega = omega_ev*ev
   Tpulse = Tpulse_fs*fs
   phi_CEP = phi_CEP_2pi*2d0*pi
 
   bvc_lattice_constant = lattice_constant*3d0
+  write(*,'(a,1pe20.12)') 'E0 [a.u. electric field] = ', E0
+  write(*,'(a,1pe16.8)') 'omega [a.u. energy]      = ', omega
+  write(*,'(a,1pe16.8)') 'Tpulse [a.u. time]       = ', Tpulse
+  write(*,'(a,1pe16.8)') 'ring length L=3a [bohr]  = ', bvc_lattice_constant
+  write(*,'(a,1pe16.8)') 'pair strength w0 [a.u.]  = ', w0
+  if (abs(w0) <= tiny(1d0)) then
+    write(*,'(a)') 'Interaction: w0=0 (noninteracting baseline).'
+  end if
+  if (mod(nx,3) /= 0) then
+    write(*,'(a)') 'Warning: nx is not divisible by 3; exact unit-cell translation'
+    write(*,'(a)') '         symmetry is not represented on the discrete ring grid.'
+  end if
 
 end subroutine read_input_parameters
 !-------------------------------------------------------
@@ -151,7 +187,6 @@ subroutine set_potentials
   integer :: id12, id23, id31
   real(8) :: x1
   real(8),parameter :: v0 = 0.11813d0
-  real(8),parameter :: w0 = 1d0*0d0
 
   allocate(vpot_1d(0:nx-1))
   allocate(wpot_1d(0:nx-1))
@@ -186,11 +221,17 @@ end subroutine set_potentials
 !-------------------------------------------------------
 subroutine check_time_step
   implicit none
-  real(8) :: hmax_est
+  real(8) :: hmax_est, avec_max_est, pmax_one_est
 
-! For the fourth-order Laplacian, the largest one-particle kinetic eigenvalue
-! is 8/(3 dx**2); three particles give 8/dx**2 before adding potentials.
-  hmax_est = 8d0/dx**2 + maxval(abs(tot_pot))
+! This is a conservative spectral-scale estimate, not a rigorous RK4 bound.
+! The fourth-order Laplacian contributes at most 8/dx**2 for three particles.
+! For H(A)=H(0)+A*sum_i p_i+3*A**2/2, use |A|<=|E0/omega| and
+! a triangle-inequality estimate of the fourth-order derivative spectrum.
+  avec_max_est = abs(E0/omega)
+  pmax_one_est = 2d0*(abs(gc1)+abs(gc2))/dx
+  hmax_est = 8d0/dx**2 + maxval(abs(tot_pot)) &
+      + 3d0*avec_max_est*pmax_one_est + 1.5d0*avec_max_est**2
+  write(*,'(a,1pe12.4)') 'RK4 field-inclusive dt*H scale estimate = ',dt*hmax_est
   if (dt*hmax_est > 2.5d0) then
     write(*,'(a,1pe12.4,a)') 'Warning: RK4 time step may be unstable; dt*Hmax ~= ', &
         dt*hmax_est, '.'
@@ -645,18 +686,22 @@ subroutine output_eigenstate_currents(nstates, values, states)
   integer,intent(in) :: nstates
   real(8),intent(in) :: values(nstates)
   complex(8),intent(in) :: states(0:nx-1,0:nx-1,0:nx-1,nstates)
-  real(8) :: current
+  real(8) :: particle_velocity, charge_current
   integer :: istate
 
 ! The eigenstates belong to the field-free Hamiltonian, so A=0 here.
   open(22,file='eigenstate_currents.out',status='replace')
-  write(22,'(a)') '# state energy current_expectation_at_A_0'
+  write(22,'(a)') '# Field-free normalized expectations; atomic units.'
+  write(22,'(a)') '# columns: state energy <sum_i(p_i+A)> -<sum_i(p_i+A)>/L'
   write(*,'(a)') 'Field-free current expectation values:'
   do istate = 1, nstates
-    current = total_current(states(:,:,:,istate),0d0)
-    write(22,'(i8,2(1x,1pe20.12))') istate,values(istate),current
-    write(*,'(a,i2,2(a,1pe16.8))') ' state=',istate, &
-        ' energy=',values(istate),' current=',current
+    particle_velocity = total_particle_velocity(states(:,:,:,istate),0d0)
+    charge_current = charge_current_density(states(:,:,:,istate),0d0)
+    write(22,'(i8,3(1x,1pe20.12))') istate,values(istate), &
+        particle_velocity,charge_current
+    write(*,'(a,i2,3(a,1pe16.8))') ' state=',istate, &
+        ' energy=',values(istate),' particle velocity=',particle_velocity, &
+        ' charge current density=',charge_current
   end do
   close(22)
 
@@ -693,18 +738,22 @@ end subroutine rayleigh_ritz_update
 subroutine propagate_tdse
   implicit none
   integer :: it, istate
-  real(8) :: t, avec, population_sum, max_population_sum
+  real(8) :: t, avec, raw_population_sum, normalized_population_sum
+  real(8) :: max_normalized_population_sum, norm_squared
   complex(8),allocatable :: hpsi(:,:,:)
 ! physics
-  real(8),allocatable :: current_t(:), energy_t(:), norm_t(:)
-  real(8),allocatable :: population_t(:,:)
+  real(8),allocatable :: particle_velocity_t(:), charge_current_t(:)
+  real(8),allocatable :: energy_t(:), norm_t(:)
+  real(8),allocatable :: raw_population_t(:,:), normalized_population_t(:,:)
   complex(8),allocatable :: amplitude_t(:,:)
 
-  allocate(current_t(0:nt))
+  allocate(particle_velocity_t(0:nt))
+  allocate(charge_current_t(0:nt))
   allocate(energy_t(0:nt))
   allocate(norm_t(0:nt))
   allocate(amplitude_t(num_eigenstates,0:nt))
-  allocate(population_t(num_eigenstates,0:nt))
+  allocate(raw_population_t(num_eigenstates,0:nt))
+  allocate(normalized_population_t(num_eigenstates,0:nt))
 
   allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
 
@@ -713,48 +762,66 @@ subroutine propagate_tdse
     write(*,'(a,i8)')'it = ', it
     t = dble(it)*dt
     avec = vector_potential(t)
+    norm_squared = real(inner_product(zpsi,zpsi))
+    if (norm_squared <= 0d0) stop 'TDSE state has non-positive norm squared.'
     call apply_hamiltonian(zpsi, hpsi, avec)
-    energy_t(it)  = real(inner_product(zpsi, hpsi))
-    current_t(it) = total_current(zpsi, avec)
-    norm_t(it)    = wavefunction_norm(zpsi)
+    energy_t(it) = real(inner_product(zpsi,hpsi))/norm_squared
+    particle_velocity_t(it) = total_particle_velocity(zpsi,avec)
+    charge_current_t(it) = charge_current_density(zpsi,avec)
+    norm_t(it) = norm_squared
     do istate = 1, num_eigenstates
       amplitude_t(istate,it) = inner_product(eigenvectors(:,:,:,istate),zpsi)
-      population_t(istate,it) = abs(amplitude_t(istate,it))**2
+      raw_population_t(istate,it) = abs(amplitude_t(istate,it))**2
+      normalized_population_t(istate,it) = &
+          raw_population_t(istate,it)/norm_squared
     end do
 
     if (it < nt) call rk4_step(t, dt)
   end do
 
   open(30,file='current.out',status='replace')
+  write(30,'(a)') '# Total current from one field run (not shift current alone).'
+  write(30,'(a)') '# Atomic units; electron charge q=-1; L=3*lattice_constant.'
+  write(30,'(a)') '# columns: t A <sum_i(p_i+A)> -<sum_i(p_i+A)>/L'// &
+      ' <psi|psi> <H>_normalized'
   do it = 0, nt
     t = dble(it)*dt
-    write(30,"(999e26.16e3)")t, vector_potential(t), current_t(it), &
-        norm_t(it), energy_t(it)
+    write(30,"(999e26.16e3)") t,vector_potential(t), &
+        particle_velocity_t(it),charge_current_t(it),norm_t(it),energy_t(it)
   end do
   close(30)
 
-! Columns: t, followed by Re(amplitude), Im(amplitude), population per state,
-! and finally the population summed over the four-state analysis subspace.
+! Raw amplitudes/populations retain the RK4 norm drift.  Normalized populations
+! divide by <psi|psi>; neither sum need be one because only four states are kept.
   open(31,file='state_populations.out',status='replace')
-  max_population_sum = 0d0
+  write(31,'(a)') '# Atomic units. For each state: Re(raw amplitude),'// &
+      ' Im(raw amplitude), raw population, normalized population.'
+  write(31,'(a)') '# columns: t [four values per state]'// &
+      ' raw_population_sum normalized_population_sum <psi|psi>'
+  max_normalized_population_sum = 0d0
   do it = 0, nt, output_stride
     t = dble(it)*dt
-    population_sum = sum(population_t(:,it))
-    max_population_sum = max(max_population_sum,population_sum)
+    raw_population_sum = sum(raw_population_t(:,it))
+    normalized_population_sum = sum(normalized_population_t(:,it))
+    max_normalized_population_sum = max(max_normalized_population_sum, &
+        normalized_population_sum)
     write(31,"(999e26.16e3)") t, &
         (real(amplitude_t(istate,it)),aimag(amplitude_t(istate,it)), &
-        population_t(istate,it),istate=1,num_eigenstates),population_sum
+        raw_population_t(istate,it),normalized_population_t(istate,it), &
+        istate=1,num_eigenstates),raw_population_sum, &
+        normalized_population_sum,norm_t(it)
   end do
   close(31)
-  write(*,'(a,1pe16.8)') 'Maximum four-state population sum = ', &
-      max_population_sum
-  if (maxval(sum(population_t,dim=1)-norm_t**2) > 1d-10) then
+  write(*,'(a,1pe16.8)') 'Maximum normalized four-state population sum = ', &
+      max_normalized_population_sum
+  if (maxval(sum(raw_population_t,dim=1)-norm_t) > 1d-10) then
     write(*,'(a,1pe16.8)') 'Warning: population sum exceeds norm squared by ', &
-        maxval(sum(population_t,dim=1)-norm_t**2)
+        maxval(sum(raw_population_t,dim=1)-norm_t)
   end if
 
   deallocate(hpsi)
-  deallocate(amplitude_t,population_t)
+  deallocate(amplitude_t,raw_population_t,normalized_population_t)
+  deallocate(particle_velocity_t,charge_current_t,energy_t,norm_t)
 
 end subroutine propagate_tdse
 !-------------------------------------------------------
@@ -817,7 +884,7 @@ real(8) function vector_potential(t)
 
 end function vector_potential
 !-------------------------------------------------------
-real(8) function total_current(psi, avec)
+real(8) function particle_velocity_numerator(psi, avec)
   implicit none
   complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
   real(8),intent(in) :: avec
@@ -873,9 +940,90 @@ real(8) function total_current(psi, avec)
 
   curr_tmp = curr_tmp*dx**3
 
-  total_current = curr_tmp
+  particle_velocity_numerator = curr_tmp
 
-end function total_current
+end function particle_velocity_numerator
+!-------------------------------------------------------
+real(8) function total_particle_velocity(psi, avec)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: avec
+  real(8) :: norm_squared
+
+! Normalized expectation of the total mechanical velocity,
+! <sum_i(p_i+A)>.  This is the raw particle-current quantity, not charge
+! current density and not an unnormalized matrix element.
+  norm_squared = real(inner_product(psi,psi))
+  if (norm_squared <= 0d0) stop 'Cannot evaluate current for zero norm.'
+  total_particle_velocity = particle_velocity_numerator(psi,avec)/norm_squared
+
+end function total_particle_velocity
+!-------------------------------------------------------
+real(8) function charge_current_density(psi, avec)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: avec
+
+! Electron charge q=-1 in atomic units; divide the total ring current by L.
+  charge_current_density = -total_particle_velocity(psi,avec) &
+      /bvc_lattice_constant
+
+end function charge_current_density
+!-------------------------------------------------------
+real(8) function normalized_energy(psi, avec)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: avec
+  complex(8),allocatable :: hpsi(:,:,:)
+  real(8) :: norm_squared
+
+  norm_squared = real(inner_product(psi,psi))
+  if (norm_squared <= 0d0) stop 'Cannot evaluate energy for zero norm.'
+  allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
+  call apply_hamiltonian(psi,hpsi,avec)
+  normalized_energy = real(inner_product(psi,hpsi))/norm_squared
+  deallocate(hpsi)
+
+end function normalized_energy
+!-------------------------------------------------------
+subroutine check_current_operator(psi)
+  implicit none
+  complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),allocatable :: scaled_psi(:,:,:)
+  real(8),parameter :: avec_test = 1d-2
+  real(8),parameter :: delta_avec = 1d-5
+  real(8),parameter :: test_scale = 1.234d0
+  real(8) :: derivative_fd, particle_velocity, abs_error, tolerance
+  real(8) :: energy_scale_error, current_scale_error
+
+! For a fixed state, central differentiation is exact for the quadratic A
+! dependence up to floating-point cancellation.  This tests that the current
+! operator uses precisely the same fourth-order stencil as H(A).
+  derivative_fd = (normalized_energy(psi,avec_test+delta_avec) &
+      - normalized_energy(psi,avec_test-delta_avec))/(2d0*delta_avec)
+  particle_velocity = total_particle_velocity(psi,avec_test)
+  abs_error = abs(derivative_fd-particle_velocity)
+  tolerance = 1d-9*max(1d0,abs(derivative_fd),abs(particle_velocity))
+  write(*,'(a,1pe16.8)') 'Current test d<H>/dA             = ',derivative_fd
+  write(*,'(a,1pe16.8)') 'Current test <sum_i(p_i+A)>      = ',particle_velocity
+  write(*,'(a,1pe16.8)') 'Current-operator test abs. error = ',abs_error
+  if (abs_error > tolerance) then
+    write(*,'(a,1pe16.8)') 'Warning: current-operator test tolerance = ',tolerance
+  end if
+
+! Deliberately rescale the fixed state to confirm that reported observables,
+! unlike the diagnostic norm and raw projections, do not inherit norm drift.
+  allocate(scaled_psi(0:nx-1,0:nx-1,0:nx-1))
+  scaled_psi = test_scale*psi
+  energy_scale_error = abs(normalized_energy(scaled_psi,avec_test) &
+      - normalized_energy(psi,avec_test))
+  current_scale_error = abs(total_particle_velocity(scaled_psi,avec_test) &
+      - total_particle_velocity(psi,avec_test))
+  write(*,'(a,1pe16.8)') 'Norm-scaling test energy error    = ',energy_scale_error
+  write(*,'(a,1pe16.8)') 'Norm-scaling test current error   = ',current_scale_error
+  deallocate(scaled_psi)
+
+end subroutine check_current_operator
 !-------------------------------------------------------
 real(8) function antisymmetry_error(psi)
   implicit none
