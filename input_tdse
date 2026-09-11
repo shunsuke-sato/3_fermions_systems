@@ -1,3 +1,4 @@
 7.6254258972d0 32  ! lattice_constant [bohr], nx [grid points]
 40 0.08    ! Tprop_fs [fs], dt [atomic unit of time]
 0.1d-6  4.46d0  20.0  0.00  ! E0 [MV/m], omega [eV], Tpulse [fs], CEP/(2*pi)
+0.0d0  ! w0 [Hartree]; zero is the noninteracting baseline

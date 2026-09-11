@@ -10,6 +10,9 @@ module global_variables
 !   eigenstate_currents.out : field-free particle velocity and charge current
 !   current.out      : total single-run current, norm, and energy versus time
 !   state_populations.out : raw projections and norm-corrected populations
+!   state_manifold_populations.out : normalized degenerate-manifold populations
+! Optional triplet mode also writes current_plus/minus/zero.out and the
+! zero-field-subtracted even response in current_second_order.out.
 ! A single-run current contains all response orders; it is not, by itself, the
 ! shift current.  An even-in-field component requires separate +E0 and -E0 runs.
 ! math parameters
@@ -28,11 +31,18 @@ module global_variables
   real(8),parameter :: gc2 = -1d0/12d0, gc1 = 2d0/3d0
 
 ! Numerical parameters kept near the top for easy changes.
-  integer,parameter :: cg_max_iter = 600
   integer,parameter :: output_stride = 1
-  integer,parameter :: num_eigenstates = 4
   real(8),parameter :: cg_energy_tol = 1d-11
   real(8),parameter :: cg_residual_tol = 1d-9
+! States separated by less than one microhartree are grouped.  This is far
+! below the optical scale but above typical numerical splittings inside a
+! converged degenerate multiplet.
+  real(8),parameter :: degeneracy_energy_tol = 1d-6
+  integer :: cg_max_iter = 2000
+  integer :: num_eigenstates = 5
+  logical :: require_converged_ground_state = .true.
+  logical :: run_second_order_triplet = .false.
+  logical :: run_field_scaling_check = .false.
 
   integer :: nx, nt
   real(8) :: dx, dt
@@ -44,7 +54,7 @@ module global_variables
   real(8) :: lattice_constant
   real(8) :: bvc_lattice_constant
 ! Pair-interaction strength.  The default w0=0 is the intentional
-! noninteracting baseline; change this module variable for interacting studies.
+! noninteracting baseline; an optional input record enables interacting studies.
   real(8) :: w0 = 0d0
 
 ! laser parameters
@@ -57,11 +67,16 @@ module global_variables
   complex(8), allocatable :: zpsi(:,:,:)
 ! eigenvectors(ix1,ix2,ix3,state_index), with state_index=1 the ground state
   real(8), allocatable :: eigenvalues(:), eigenstate_residuals(:)
+  integer, allocatable :: eigenstate_iterations(:)
+  logical, allocatable :: eigenstate_converged(:)
   complex(8), allocatable :: eigenvectors(:,:,:,:)
 
 ! potentials
   real(8), allocatable :: vpot_1d(:), wpot_1d(:)
   real(8), allocatable :: vpot(:,:,:), wpot(:,:,:), tot_pot(:,:,:)
+! Field-free one-body eigenbasis used only to construct high-quality
+! antisymmetric many-body initial guesses.
+  real(8), allocatable :: onebody_values(:),onebody_vectors(:,:)
 
 end module global_variables
 !-------------------------------------------------------
@@ -73,6 +88,7 @@ program main
   call initialize
   call compute_lowest_fermion_states(num_eigenstates, eigenvalues, &
       eigenvectors, eigenstate_residuals)
+  call output_energy_gaps(num_eigenstates,eigenvalues)
   call output_eigenstate_currents(num_eigenstates, eigenvalues, eigenvectors)
   zpsi = eigenvectors(:,:,:,1)
   e0_gs = eigenvalues(1)
@@ -86,7 +102,18 @@ program main
 
   call check_current_operator(zpsi)
 
-  call propagate_tdse
+  if (require_converged_ground_state .and. .not.eigenstate_converged(1)) then
+    write(*,'(a)') 'ERROR: ground state did not meet the strict residual target.'
+    write(*,'(a)') 'Time propagation disabled by require_converged_ground_state.'
+    call finalize
+    stop 2
+  end if
+
+  if (run_second_order_triplet) then
+    call propagate_second_order
+  else
+    call propagate_single_run
+  end if
   call finalize
 
 contains
@@ -103,21 +130,35 @@ subroutine initialize
   allocate(tot_pot(0:nx-1, 0:nx-1, 0:nx-1))
   allocate(eigenvalues(num_eigenstates))
   allocate(eigenstate_residuals(num_eigenstates))
+  allocate(eigenstate_iterations(num_eigenstates))
+  allocate(eigenstate_converged(num_eigenstates))
   allocate(eigenvectors(0:nx-1,0:nx-1,0:nx-1,num_eigenstates))
 
   call set_potentials
+  call compute_onebody_basis
   call check_time_step
 
 end subroutine initialize
 !-------------------------------------------------------
 subroutine read_input_parameters
   implicit none
+  integer :: ios
   real(8) :: Tprop_fs
   real(8) :: E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi
 
   read(*,*)lattice_constant, nx
   read(*,*)Tprop_fs, dt
   read(*,*)E0_MVm, omega_ev, Tpulse_fs, phi_CEP_2pi
+
+! Optional trailing records preserve compatibility with the original input:
+!   record 4: w0 [Hartree] (default 0, the noninteracting baseline)
+!   record 5: run_triplet, run_scaling, require_converged, nstates, max_iter
+  read(*,*,iostat=ios) w0
+  if (ios /= 0) w0 = 0d0
+  if (ios == 0) then
+    read(*,*,iostat=ios) run_second_order_triplet,run_field_scaling_check, &
+        require_converged_ground_state,num_eigenstates,cg_max_iter
+  end if
 
 ! Input units are intentionally mixed for backward compatibility:
 ! lattice_constant and dt are in atomic units (bohr and atomic time), while
@@ -128,6 +169,9 @@ subroutine read_input_parameters
   if (Tprop_fs <= 0d0) stop 'Tprop_fs must be > 0 fs.'
   if (Tpulse_fs <= 0d0) stop 'Tpulse_fs must be > 0 fs.'
   if (omega_ev <= 0d0) stop 'omega_ev must be > 0 eV.'
+  if (num_eigenstates < 5) stop 'num_eigenstates must be at least 5.'
+  if (cg_max_iter < 1) stop 'cg_max_iter must be positive.'
+  if (run_field_scaling_check) run_second_order_triplet = .true.
 
   write(*,'(a)') 'Input-unit convention: lattice_constant [bohr], nx [grid points]'
   write(*,'(a)') '  Tprop_fs/Tpulse_fs [fs], dt [a.u. time], E0_MVm [MV/m],'
@@ -136,9 +180,6 @@ subroutine read_input_parameters
   write(*,*)'nx = ', nx
   write(*,*)'Tprop_fs = ', Tprop_fs
   write(*,*)'requested dt [a.u. time] = ', dt
-  write(*,*)'E0_MVm = ', E0_MVm
-  write(*,*)'omega_ev = ', omega_ev
-  write(*,*)'Tpulse_fs = ', Tpulse_fs
   write(*,*)'phi_CEP_2pi = ', phi_CEP_2pi
   Tprop = Tprop_fs*fs
   nt = max(1, nint(Tprop/dt))
@@ -153,18 +194,33 @@ subroutine read_input_parameters
   phi_CEP = phi_CEP_2pi*2d0*pi
 
   bvc_lattice_constant = lattice_constant*3d0
-  write(*,'(a,1pe20.12)') 'E0 [a.u. electric field] = ', E0
-  write(*,'(a,1pe16.8)') 'omega [a.u. energy]      = ', omega
-  write(*,'(a,1pe16.8)') 'Tpulse [a.u. time]       = ', Tpulse
+  write(*,'(a)') 'Input field amplitude:'
+  write(*,'(a,1pe20.12,a)') '  E0 = ',E0_MVm,' MV/m'
+  write(*,'(a,1pe20.12,a)') '     = ',E0_MVm*1d6,' V/m'
+  write(*,'(a,1pe20.12,a)') '     = ',E0,' a.u.'
+  write(*,'(a,1pe20.12,a)') 'omega = ',omega_ev,' eV'
+  write(*,'(a,1pe20.12,a)') '      = ',omega,' a.u.'
+  write(*,'(a,1pe20.12,a)') 'Tpulse = ',Tpulse_fs,' fs'
+  write(*,'(a,1pe20.12,a)') '       = ',Tpulse,' a.u.'
   write(*,'(a,1pe16.8)') 'ring length L=3a [bohr]  = ', bvc_lattice_constant
   write(*,'(a,1pe16.8)') 'pair strength w0 [a.u.]  = ', w0
   if (abs(w0) <= tiny(1d0)) then
     write(*,'(a)') 'Interaction: w0=0 (noninteracting baseline).'
   end if
   if (mod(nx,3) /= 0) then
-    write(*,'(a)') 'Warning: nx is not divisible by 3; exact unit-cell translation'
-    write(*,'(a)') '         symmetry is not represented on the discrete ring grid.'
+    write(*,'(a)') 'WARNING:'
+    write(*,'(a)') 'nx is not divisible by 3.'
+    write(*,'(a)') 'The three-unit-cell translation symmetry is not represented exactly'// &
+        ' on the discrete grid.'
+    write(*,'(a)') 'Use nx = 3*m for production shift-current calculations.'
   end if
+  write(*,'(a,i8)') 'num_eigenstates = ',num_eigenstates
+  write(*,'(a,i8)') 'cg_max_iter = ',cg_max_iter
+  write(*,'(a,1pe12.4)') 'Target residual norm = ',cg_residual_tol
+  write(*,'(a,l1)') 'require_converged_ground_state = ', &
+      require_converged_ground_state
+  write(*,'(a,l1)') 'run_second_order_triplet = ',run_second_order_triplet
+  write(*,'(a,l1)') 'run_field_scaling_check = ',run_field_scaling_check
 
 end subroutine read_input_parameters
 !-------------------------------------------------------
@@ -219,6 +275,115 @@ subroutine set_potentials
 
 end subroutine set_potentials
 !-------------------------------------------------------
+subroutine compute_onebody_basis
+  implicit none
+  real(8),allocatable :: hmat(:,:)
+  real(8) :: c0,c1,c2
+  integer :: i
+
+  allocate(hmat(0:nx-1,0:nx-1))
+  allocate(onebody_values(0:nx-1),onebody_vectors(0:nx-1,0:nx-1))
+  hmat=0d0
+  c0=-0.5d0*lc0/dx**2
+  c1=-0.5d0*lc1/dx**2
+  c2=-0.5d0*lc2/dx**2
+  do i=0,nx-1
+    hmat(i,i)=hmat(i,i)+c0+vpot_1d(i)
+    hmat(i,ipbc(i+1))=hmat(i,ipbc(i+1))+c1
+    hmat(i,ipbc(i-1))=hmat(i,ipbc(i-1))+c1
+    hmat(i,ipbc(i+2))=hmat(i,ipbc(i+2))+c2
+    hmat(i,ipbc(i-2))=hmat(i,ipbc(i-2))+c2
+  end do
+  call jacobi_real_symmetric(hmat,onebody_values,onebody_vectors)
+  call sort_onebody_eigenpairs(onebody_values,onebody_vectors)
+  deallocate(hmat)
+
+end subroutine compute_onebody_basis
+!-------------------------------------------------------
+subroutine jacobi_real_symmetric(matrix,values,vectors)
+  implicit none
+  real(8),intent(inout) :: matrix(0:nx-1,0:nx-1)
+  real(8),intent(out) :: values(0:nx-1),vectors(0:nx-1,0:nx-1)
+  integer :: sweep,p,q,k
+  real(8) :: app,aqq,apq,tau,t,c,s,akp,akq,vkp,vkq,max_offdiag
+
+  vectors=0d0
+  do p=0,nx-1
+    vectors(p,p)=1d0
+  end do
+  do sweep=1,100
+    max_offdiag=0d0
+    do p=0,nx-2
+      do q=p+1,nx-1
+        apq=matrix(p,q)
+        max_offdiag=max(max_offdiag,abs(apq))
+        if (abs(apq) <= 1d-15) cycle
+        app=matrix(p,p)
+        aqq=matrix(q,q)
+        tau=(aqq-app)/(2d0*apq)
+        if (tau >= 0d0) then
+          t=1d0/(tau+sqrt(1d0+tau*tau))
+        else
+          t=-1d0/(-tau+sqrt(1d0+tau*tau))
+        end if
+        c=1d0/sqrt(1d0+t*t)
+        s=t*c
+        matrix(p,p)=app-t*apq
+        matrix(q,q)=aqq+t*apq
+        matrix(p,q)=0d0
+        matrix(q,p)=0d0
+        do k=0,nx-1
+          if (k /= p .and. k /= q) then
+            akp=matrix(k,p)
+            akq=matrix(k,q)
+            matrix(k,p)=c*akp-s*akq
+            matrix(p,k)=matrix(k,p)
+            matrix(k,q)=s*akp+c*akq
+            matrix(q,k)=matrix(k,q)
+          end if
+          vkp=vectors(k,p)
+          vkq=vectors(k,q)
+          vectors(k,p)=c*vkp-s*vkq
+          vectors(k,q)=s*vkp+c*vkq
+        end do
+      end do
+    end do
+    if (max_offdiag < 1d-14) exit
+  end do
+  do p=0,nx-1
+    values(p)=matrix(p,p)
+  end do
+  if (max_offdiag >= 1d-12) then
+    write(*,'(a,1pe16.8)') 'Warning: one-body Jacobi off-diagonal norm = ', &
+        max_offdiag
+  end if
+
+end subroutine jacobi_real_symmetric
+!-------------------------------------------------------
+subroutine sort_onebody_eigenpairs(values,vectors)
+  implicit none
+  real(8),intent(inout) :: values(0:nx-1),vectors(0:nx-1,0:nx-1)
+  integer :: i,j
+  real(8) :: value_work
+  real(8),allocatable :: vector_work(:)
+
+  allocate(vector_work(0:nx-1))
+  do i=0,nx-2
+    do j=i+1,nx-1
+      if (values(j) < values(i)) then
+        value_work=values(i)
+        values(i)=values(j)
+        values(j)=value_work
+        vector_work=vectors(:,i)
+        vectors(:,i)=vectors(:,j)
+        vectors(:,j)=vector_work
+      end if
+    end do
+  end do
+  deallocate(vector_work)
+
+end subroutine sort_onebody_eigenpairs
+!-------------------------------------------------------
 subroutine check_time_step
   implicit none
   real(8) :: hmax_est, avec_max_est, pmax_one_est
@@ -256,32 +421,6 @@ integer function ipbc(i)
   ipbc = modulo(i, nx)
 
 end function ipbc
-!-------------------------------------------------------
-subroutine initialize_antisymmetric_state
-  implicit none
-  integer :: ix1, ix2, ix3
-  real(8) :: k(3)
-  complex(8) :: a(3), b(3), c(3)
-
-  k(1) = -2d0*pi/bvc_lattice_constant
-  k(2) = 0d0
-  k(3) =  2d0*pi/bvc_lattice_constant
-
-  do ix1 = 0, nx-1
-    do ix2 = 0, nx-1
-      do ix3 = 0, nx-1
-        a = exp(zi*k*xn(ix1))
-        b = exp(zi*k*xn(ix2))
-        c = exp(zi*k*xn(ix3))
-        zpsi(ix1,ix2,ix3) = determinant3(a, b, c)
-      end do
-    end do
-  end do
-
-  call antisymmetrize(zpsi)
-  call normalize(zpsi)
-
-end subroutine initialize_antisymmetric_state
 !-------------------------------------------------------
 complex(8) function determinant3(a, b, c)
   implicit none
@@ -433,14 +572,16 @@ subroutine compute_lowest_fermion_states(nstates, eigenvalues_out, &
   open(20,file='ground_state.log',status='replace')
   write(20,'(a)') '# iter energy residual_norm norm antisymmetry_error'
   open(21,file='eigenstates.log',status='replace')
-  write(21,'(a)') '# state iter energy residual_norm norm antisymmetry_error'
+  write(21,'(a)') '# state iter energy residual_norm norm antisymmetry_error'// &
+      ' best_residual residual_increased'
 
   do istate = 1, nstates
     call initialize_eigenstate_guess(istate, psi)
     call orthogonalize_against_states(psi, eigenvectors_out, istate-1)
     call normalize(psi)
     call minimize_projected_rayleigh(istate, psi, eigenvectors_out, &
-        istate-1, eigenvalues_out(istate), residuals_out(istate))
+        istate-1, eigenvalues_out(istate), residuals_out(istate), &
+        eigenstate_iterations(istate),eigenstate_converged(istate))
     eigenvectors_out(:,:,:,istate) = psi
   end do
 
@@ -457,31 +598,21 @@ subroutine initialize_eigenstate_guess(istate, psi)
   implicit none
   integer,intent(in) :: istate
   complex(8),intent(out) :: psi(0:nx-1,0:nx-1,0:nx-1)
-  integer :: ix1, ix2, ix3, isel
-  integer :: modes(3,4)
-  real(8) :: k(3)
+  integer :: ix1, ix2, ix3
+  integer :: modes(3)
   complex(8) :: a(3), b(3), c(3)
 
-  if (istate == 1) then
-    call initialize_antisymmetric_state
-    psi = zpsi
-    return
-  end if
-
-! Low-kinetic-energy Slater determinants give reproducible independent seeds.
-  modes(:,1) = (/ -1,  0,  1 /)
-  modes(:,2) = (/ -2, -1,  0 /)
-  modes(:,3) = (/  0,  1,  2 /)
-  modes(:,4) = (/ -2,  0,  1 /)
-  isel = 1 + modulo(istate-1,4)
-  k = 2d0*pi*dble(modes(:,isel))/bvc_lattice_constant
+! Select a different low-energy one-body configuration for every state.
+! At w0=0 these determinants are exact discrete many-body eigenstates; for
+! w0/=0 they remain physically motivated, linearly independent CG seeds.
+  call select_slater_configuration(istate,modes)
 
   do ix1 = 0, nx-1
     do ix2 = 0, nx-1
       do ix3 = 0, nx-1
-        a = exp(zi*k*xn(ix1))
-        b = exp(zi*k*xn(ix2))
-        c = exp(zi*k*xn(ix3))
+        a = cmplx(onebody_vectors(ix1,modes),0d0,kind(zi))
+        b = cmplx(onebody_vectors(ix2,modes),0d0,kind(zi))
+        c = cmplx(onebody_vectors(ix3,modes),0d0,kind(zi))
         psi(ix1,ix2,ix3) = determinant3(a,b,c)
       end do
     end do
@@ -490,6 +621,48 @@ subroutine initialize_eigenstate_guess(istate, psi)
   call antisymmetrize(psi)
 
 end subroutine initialize_eigenstate_guess
+!-------------------------------------------------------
+subroutine select_slater_configuration(rank,modes)
+  implicit none
+  integer,intent(in) :: rank
+  integer,intent(out) :: modes(3)
+  integer :: i,j,k,nconfig,index,best_index,selection
+  integer,allocatable :: configurations(:,:)
+  real(8),allocatable :: configuration_energy(:)
+  logical,allocatable :: selected(:)
+  real(8) :: best_energy
+
+  nconfig=nx*(nx-1)*(nx-2)/6
+  if (rank > nconfig) stop 'Too many eigenstates for antisymmetric grid space.'
+  allocate(configurations(3,nconfig),configuration_energy(nconfig))
+  allocate(selected(nconfig))
+  index=0
+  do i=0,nx-3
+    do j=i+1,nx-2
+      do k=j+1,nx-1
+        index=index+1
+        configurations(:,index)=(/i,j,k/)
+        configuration_energy(index)=onebody_values(i)+onebody_values(j)+ &
+            onebody_values(k)
+      end do
+    end do
+  end do
+  selected=.false.
+  best_index=1
+  do selection=1,rank
+    best_energy=huge(1d0)
+    do index=1,nconfig
+      if (.not.selected(index) .and. configuration_energy(index)<best_energy) then
+        best_energy=configuration_energy(index)
+        best_index=index
+      end if
+    end do
+    selected(best_index)=.true.
+  end do
+  modes=configurations(:,best_index)
+  deallocate(configurations,configuration_energy,selected)
+
+end subroutine select_slater_configuration
 !-------------------------------------------------------
 subroutine orthogonalize_against_states(psi, states, nstates_done)
   implicit none
@@ -511,18 +684,21 @@ subroutine orthogonalize_against_states(psi, states, nstates_done)
 end subroutine orthogonalize_against_states
 !-------------------------------------------------------
 subroutine minimize_projected_rayleigh(istate, psi, states, nstates_done, &
-    energy, residual_norm)
+    energy, residual_norm,iterations_used,converged)
   implicit none
   integer,intent(in) :: istate, nstates_done
   complex(8),intent(inout) :: psi(0:nx-1,0:nx-1,0:nx-1)
   complex(8),intent(in) :: states(0:nx-1,0:nx-1,0:nx-1,*)
   real(8),intent(out) :: energy, residual_norm
+  integer,intent(out) :: iterations_used
+  logical,intent(out) :: converged
   complex(8),allocatable :: hpsi(:,:,:), residual(:,:,:), xi(:,:,:)
   complex(8),allocatable :: direction(:,:,:), direction_old(:,:,:), hp(:,:,:)
   complex(8) :: overlap
   real(8) :: xixi, xixi_old, gamma, direction_norm, energy_old
-  integer :: iter
-  logical :: converged
+  real(8) :: best_residual,previous_residual
+  integer :: iter, stagnation_count, increase_count
+  logical :: residual_increased
 
   allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
   allocate(residual(0:nx-1,0:nx-1,0:nx-1))
@@ -534,13 +710,18 @@ subroutine minimize_projected_rayleigh(istate, psi, states, nstates_done, &
   direction_old = (0d0,0d0)
   xixi_old = 1d0
   converged = .false.
+  iterations_used = 0
+  stagnation_count = 0
+  increase_count = 0
 
   call apply_hamiltonian(psi,hpsi,0d0)
   energy = real(inner_product(psi,hpsi))
   residual = hpsi - energy*psi
   residual_norm = wavefunction_norm(residual)
-  write(21,'(2i8,4(1x,1pe20.12))') istate,0,energy,residual_norm, &
-      wavefunction_norm(psi),antisymmetry_error(psi)
+  best_residual = residual_norm
+  previous_residual = residual_norm
+  write(21,'(2i8,5(1x,1pe20.12),1x,l1)') istate,0,energy,residual_norm, &
+      wavefunction_norm(psi),antisymmetry_error(psi),best_residual,.false.
   if (istate == 1) write(20,'(i8,4(1x,1pe20.12))') 0,energy, &
       residual_norm,wavefunction_norm(psi),antisymmetry_error(psi)
 
@@ -550,12 +731,15 @@ subroutine minimize_projected_rayleigh(istate, psi, states, nstates_done, &
       exit
     end if
 
-    xi = -residual
+! Jacobi preconditioning uses the field-free Hamiltonian diagonal.  The
+! positive floor avoids amplifying components near a shifted diagonal zero.
+    call apply_diagonal_preconditioner(residual,xi,energy)
+    xi = -xi
     call orthogonalize_against_states(xi,states,nstates_done)
     overlap = inner_product(psi,xi)
     xi = xi - overlap*psi
     call antisymmetrize(xi)
-    xixi = real(inner_product(xi,xi))
+    xixi = -real(inner_product(residual,xi))
     if (xixi <= 1d-28) exit
 
 ! Periodic restart limits loss of conjugacy in nearly degenerate subspaces.
@@ -588,18 +772,45 @@ subroutine minimize_projected_rayleigh(istate, psi, states, nstates_done, &
     energy = real(inner_product(psi,hpsi))
     residual = hpsi - energy*psi
     residual_norm = wavefunction_norm(residual)
-    write(21,'(2i8,4(1x,1pe20.12))') istate,iter,energy,residual_norm, &
-        wavefunction_norm(psi),antisymmetry_error(psi)
+    residual_increased = residual_norm > previous_residual*(1d0+1d-12)
+    if (residual_increased) increase_count = increase_count+1
+    if (residual_norm < best_residual*(1d0-1d-4)) then
+      best_residual = residual_norm
+      stagnation_count = 0
+    else
+      stagnation_count = stagnation_count+1
+    end if
+    write(21,'(2i8,5(1x,1pe20.12),1x,l1)') istate,iter,energy, &
+        residual_norm,wavefunction_norm(psi),antisymmetry_error(psi), &
+        best_residual,residual_increased
     if (istate == 1) write(20,'(i8,4(1x,1pe20.12))') iter,energy, &
         residual_norm,wavefunction_norm(psi),antisymmetry_error(psi)
 
     xixi_old = xixi
+    previous_residual = residual_norm
+    iterations_used = iter
     if (residual_norm < cg_residual_tol .and. &
         abs(energy-energy_old) < cg_energy_tol) then
       converged = .true.
       exit
     end if
   end do
+
+  iterations_used = min(iterations_used,cg_max_iter)
+  write(*,'(a,i4)') 'Eigenstate solver state   : ',istate
+  write(*,'(a,1pe16.8)') '  Target residual norm   : ',cg_residual_tol
+  write(*,'(a,1pe16.8)') '  Final residual norm    : ',residual_norm
+  write(*,'(a,i8)') '  Iterations             : ',iterations_used
+  if (converged) then
+    write(*,'(a)') '  Status                 : CONVERGED'
+  else
+    write(*,'(a)') '  Status                 : NOT CONVERGED'
+  end if
+  write(*,'(a,i8)') '  Residual increases     : ',increase_count
+  if (stagnation_count >= 50) then
+    write(*,'(a,i8,a)') '  Diagnostic             : residual stagnated for ', &
+        stagnation_count,' final iterations.'
+  end if
 
   if (.not.converged .and. residual_norm >= cg_residual_tol) then
     write(*,'(a,i4,a,i8,a,1pe16.8,a,1pe16.8)') &
@@ -612,6 +823,27 @@ subroutine minimize_projected_rayleigh(istate, psi, states, nstates_done, &
 
 end subroutine minimize_projected_rayleigh
 !-------------------------------------------------------
+subroutine apply_diagonal_preconditioner(residual,preconditioned,energy)
+  implicit none
+  complex(8),intent(in) :: residual(0:nx-1,0:nx-1,0:nx-1)
+  complex(8),intent(out) :: preconditioned(0:nx-1,0:nx-1,0:nx-1)
+  real(8),intent(in) :: energy
+  integer :: ix1,ix2,ix3
+  real(8) :: diagonal,denominator,denominator_floor
+
+  denominator_floor=0.1d0/dx**2
+  do ix1=0,nx-1
+    do ix2=0,nx-1
+      do ix3=0,nx-1
+        diagonal=3d0*(-0.5d0*lc0/dx**2)+tot_pot(ix1,ix2,ix3)
+        denominator=max(abs(diagonal-energy),denominator_floor)
+        preconditioned(ix1,ix2,ix3)=residual(ix1,ix2,ix3)/denominator
+      end do
+    end do
+  end do
+
+end subroutine apply_diagonal_preconditioner
+!-------------------------------------------------------
 subroutine sort_eigenpairs(nstates, values, states, residuals)
   implicit none
   integer,intent(in) :: nstates
@@ -619,6 +851,8 @@ subroutine sort_eigenpairs(nstates, values, states, residuals)
   complex(8),intent(inout) :: states(0:nx-1,0:nx-1,0:nx-1,nstates)
   complex(8),allocatable :: work(:,:,:)
   real(8) :: value_work, residual_work
+  integer :: iteration_work
+  logical :: converged_work
   integer :: i, j
 
   allocate(work(0:nx-1,0:nx-1,0:nx-1))
@@ -631,6 +865,12 @@ subroutine sort_eigenpairs(nstates, values, states, residuals)
         residual_work = residuals(i)
         residuals(i) = residuals(j)
         residuals(j) = residual_work
+        iteration_work = eigenstate_iterations(i)
+        eigenstate_iterations(i) = eigenstate_iterations(j)
+        eigenstate_iterations(j) = iteration_work
+        converged_work = eigenstate_converged(i)
+        eigenstate_converged(i) = eigenstate_converged(j)
+        eigenstate_converged(j) = converged_work
         work = states(:,:,:,i)
         states(:,:,:,i) = states(:,:,:,j)
         states(:,:,:,j) = work
@@ -665,13 +905,15 @@ subroutine verify_eigenstates(nstates, values, states, residuals)
     values(i) = real(inner_product(states(:,:,:,i),hpsi))
     residual = hpsi - values(i)*states(:,:,:,i)
     residuals(i) = wavefunction_norm(residual)
+    eigenstate_converged(i) = residuals(i) < cg_residual_tol
   end do
 
   write(*,'(a)') 'Lowest antisymmetric eigenstates:'
   do i = 1, nstates
-    write(*,'(a,i2,3(a,1pe16.8))') ' state=',i,' energy=',values(i), &
+    write(*,'(a,i2,3(a,1pe16.8),a,i8,a,l1)') ' state=',i-1,' energy=',values(i), &
         ' residual=',residuals(i),' antisymmetry_error=', &
-        antisymmetry_error(states(:,:,:,i))
+        antisymmetry_error(states(:,:,:,i)),' iterations=', &
+        eigenstate_iterations(i),' converged=',eigenstate_converged(i)
   end do
   write(*,'(a,l2)') ' Energies in ascending order = ', &
       all(values(2:nstates) >= values(1:nstates-1))
@@ -680,6 +922,29 @@ subroutine verify_eigenstates(nstates, values, states, residuals)
   deallocate(hpsi,residual)
 
 end subroutine verify_eigenstates
+!-------------------------------------------------------
+subroutine output_energy_gaps(nstates,values)
+  implicit none
+  integer,intent(in) :: nstates
+  real(8),intent(in) :: values(nstates)
+  integer :: i
+  real(8) :: gap,gap_ev,detuning_ev
+
+  open(23,file='eigenstate_energies.out',status='replace')
+  write(23,'(a)') '# state E_n(Ha) DeltaE(Ha) DeltaE(eV) detuning(eV)'
+  write(*,'(a)') 'Eigenstate energies and laser detunings:'
+  write(*,'(a)') ' state       E_n(Ha)        DeltaE(Ha)'// &
+      '      DeltaE(eV)     detuning(eV)'
+  do i=1,nstates
+    gap=values(i)-values(1)
+    gap_ev=gap/ev
+    detuning_ev=(gap-omega)/ev
+    write(23,'(i8,4(1x,1pe20.12))') i-1,values(i),gap,gap_ev,detuning_ev
+    write(*,'(i6,4(1x,1pe16.8))') i-1,values(i),gap,gap_ev,detuning_ev
+  end do
+  close(23)
+
+end subroutine output_energy_gaps
 !-------------------------------------------------------
 subroutine output_eigenstate_currents(nstates, values, states)
   implicit none
@@ -735,99 +1000,240 @@ subroutine rayleigh_ritz_update(psi, p, hpsi, hp, energy)
 
 end subroutine rayleigh_ritz_update
 !-------------------------------------------------------
-subroutine propagate_tdse
+subroutine propagate_single_run
   implicit none
-  integer :: it, istate
-  real(8) :: t, avec, raw_population_sum, normalized_population_sum
-  real(8) :: max_normalized_population_sum, norm_squared
-  complex(8),allocatable :: hpsi(:,:,:)
-! physics
-  real(8),allocatable :: particle_velocity_t(:), charge_current_t(:)
-  real(8),allocatable :: energy_t(:), norm_t(:)
-  real(8),allocatable :: raw_population_t(:,:), normalized_population_t(:,:)
-  complex(8),allocatable :: amplitude_t(:,:)
+  real(8),allocatable :: current_t(:)
 
-  allocate(particle_velocity_t(0:nt))
-  allocate(charge_current_t(0:nt))
-  allocate(energy_t(0:nt))
-  allocate(norm_t(0:nt))
-  allocate(amplitude_t(num_eigenstates,0:nt))
-  allocate(raw_population_t(num_eigenstates,0:nt))
-  allocate(normalized_population_t(num_eigenstates,0:nt))
+  allocate(current_t(0:nt))
+  call propagate_trajectory(E0,'current.out',.true.,current_t)
+  if (abs(E0) <= tiny(1d0)) then
+    write(*,'(a)') 'Zero-field numerical-current diagnostic:'
+    write(*,'(a,1pe16.8)') '  max_t |J0(t)| = ',maxval(abs(current_t))
+    write(*,'(a,1pe16.8)') '  RMS[J0]       = ', &
+        sqrt(sum(current_t*current_t)/dble(nt+1))
+  end if
+  deallocate(current_t)
+
+end subroutine propagate_single_run
+!-------------------------------------------------------
+subroutine propagate_second_order
+  implicit none
+  real(8),allocatable :: jplus(:),jminus(:),jzero(:)
+  real(8),allocatable :: jplus_half(:),jminus_half(:),jzero_half(:)
+  real(8),allocatable :: response(:),response_half(:)
+
+  allocate(jplus(0:nt),jminus(0:nt),jzero(0:nt),response(0:nt))
+! Every trajectory is reset to the same already-computed ground-state vector.
+  call propagate_trajectory(E0,'current_plus.out',.true.,jplus)
+  call propagate_trajectory(-E0,'current_minus.out',.false.,jminus)
+  call propagate_trajectory(0d0,'current_zero.out',.false.,jzero)
+  call write_second_order_file('current_second_order.out',E0,jplus,jminus, &
+      jzero,response)
+  call report_zero_field_floor(jzero,response,E0)
+
+  if (run_field_scaling_check) then
+    allocate(jplus_half(0:nt),jminus_half(0:nt),jzero_half(0:nt))
+    allocate(response_half(0:nt))
+    call propagate_trajectory(0.5d0*E0,'current_plus_half.out',.false., &
+        jplus_half)
+    call propagate_trajectory(-0.5d0*E0,'current_minus_half.out',.false., &
+        jminus_half)
+    call propagate_trajectory(0d0,'current_zero_half.out',.false.,jzero_half)
+    call write_second_order_file('current_second_order_half.out',0.5d0*E0, &
+        jplus_half,jminus_half,jzero_half,response_half)
+    call write_scaling_comparison(response,response_half,E0)
+    deallocate(jplus_half,jminus_half,jzero_half,response_half)
+  end if
+  deallocate(jplus,jminus,jzero,response)
+
+end subroutine propagate_second_order
+!-------------------------------------------------------
+subroutine propagate_trajectory(field_amplitude,current_file,write_pop,current_t)
+  implicit none
+  real(8),intent(in) :: field_amplitude
+  character(*),intent(in) :: current_file
+  logical,intent(in) :: write_pop
+  real(8),intent(out) :: current_t(0:nt)
+  integer :: it,istate,imanifold,nmanifolds
+  integer,allocatable :: manifold(:)
+  real(8) :: t,avec,norm_squared,energy,particle_velocity
+  real(8) :: raw_sum,normalized_sum
+  real(8),allocatable :: raw_population(:),normalized_population(:)
+  real(8),allocatable :: manifold_population(:)
+  complex(8),allocatable :: hpsi(:,:,:),amplitude(:)
 
   allocate(hpsi(0:nx-1,0:nx-1,0:nx-1))
+  allocate(amplitude(num_eigenstates),raw_population(num_eigenstates))
+  allocate(normalized_population(num_eigenstates),manifold(num_eigenstates))
+  call assign_energy_manifolds(manifold,nmanifolds)
+  allocate(manifold_population(nmanifolds))
+  zpsi = eigenvectors(:,:,:,1)
 
-
-  do it = 0, nt
-    write(*,'(a,i8)')'it = ', it
-    t = dble(it)*dt
-    avec = vector_potential(t)
-    norm_squared = real(inner_product(zpsi,zpsi))
-    if (norm_squared <= 0d0) stop 'TDSE state has non-positive norm squared.'
-    call apply_hamiltonian(zpsi, hpsi, avec)
-    energy_t(it) = real(inner_product(zpsi,hpsi))/norm_squared
-    particle_velocity_t(it) = total_particle_velocity(zpsi,avec)
-    charge_current_t(it) = charge_current_density(zpsi,avec)
-    norm_t(it) = norm_squared
-    do istate = 1, num_eigenstates
-      amplitude_t(istate,it) = inner_product(eigenvectors(:,:,:,istate),zpsi)
-      raw_population_t(istate,it) = abs(amplitude_t(istate,it))**2
-      normalized_population_t(istate,it) = &
-          raw_population_t(istate,it)/norm_squared
-    end do
-
-    if (it < nt) call rk4_step(t, dt)
-  end do
-
-  open(30,file='current.out',status='replace')
-  write(30,'(a)') '# Total current from one field run (not shift current alone).'
-  write(30,'(a)') '# Atomic units; electron charge q=-1; L=3*lattice_constant.'
-  write(30,'(a)') '# columns: t A <sum_i(p_i+A)> -<sum_i(p_i+A)>/L'// &
-      ' <psi|psi> <H>_normalized'
-  do it = 0, nt
-    t = dble(it)*dt
-    write(30,"(999e26.16e3)") t,vector_potential(t), &
-        particle_velocity_t(it),charge_current_t(it),norm_t(it),energy_t(it)
-  end do
-  close(30)
-
-! Raw amplitudes/populations retain the RK4 norm drift.  Normalized populations
-! divide by <psi|psi>; neither sum need be one because only four states are kept.
-  open(31,file='state_populations.out',status='replace')
-  write(31,'(a)') '# Atomic units. For each state: Re(raw amplitude),'// &
-      ' Im(raw amplitude), raw population, normalized population.'
-  write(31,'(a)') '# columns: t [four values per state]'// &
-      ' raw_population_sum normalized_population_sum <psi|psi>'
-  max_normalized_population_sum = 0d0
-  do it = 0, nt, output_stride
-    t = dble(it)*dt
-    raw_population_sum = sum(raw_population_t(:,it))
-    normalized_population_sum = sum(normalized_population_t(:,it))
-    max_normalized_population_sum = max(max_normalized_population_sum, &
-        normalized_population_sum)
-    write(31,"(999e26.16e3)") t, &
-        (real(amplitude_t(istate,it)),aimag(amplitude_t(istate,it)), &
-        raw_population_t(istate,it),normalized_population_t(istate,it), &
-        istate=1,num_eigenstates),raw_population_sum, &
-        normalized_population_sum,norm_t(it)
-  end do
-  close(31)
-  write(*,'(a,1pe16.8)') 'Maximum normalized four-state population sum = ', &
-      max_normalized_population_sum
-  if (maxval(sum(raw_population_t,dim=1)-norm_t) > 1d-10) then
-    write(*,'(a,1pe16.8)') 'Warning: population sum exceeds norm squared by ', &
-        maxval(sum(raw_population_t,dim=1)-norm_t)
+  open(30,file=current_file,status='replace')
+  write(30,'(a)') '# Physical charge current density for one trajectory.'
+  write(30,'(a)') '# Atomic units; q=-1; columns: t A particle_velocity'// &
+      ' charge_current_density norm_squared normalized_energy'
+  if (write_pop) then
+    open(31,file='state_populations.out',status='replace')
+    write(31,'(a)') '# columns: t norm, then for each state: Re(overlap)'// &
+        ' Im(overlap) raw_overlap_squared normalized_population'
+    write(31,'(a)') '# normalized_population=|<n|psi>|^2/<psi|psi>.'
+    write(31,'(a)') '# final columns: raw_population_sum'// &
+        ' normalized_population_sum.'
+    open(32,file='state_manifold_populations.out',status='replace')
+    write(32,'(a,1pe12.4)') '# Energy grouping tolerance [Hartree] = ', &
+        degeneracy_energy_tol
+    write(32,'(a)') '# columns: t(a.u.) norm manifold_0 manifold_1 ...'// &
+        ' (normalized populations)'
   end if
 
-  deallocate(hpsi)
-  deallocate(amplitude_t,raw_population_t,normalized_population_t)
-  deallocate(particle_velocity_t,charge_current_t,energy_t,norm_t)
+  do it = 0,nt
+    if (mod(it,max(1,nt/100)) == 0) write(*,'(a,a,a,i8)') &
+        'trajectory ',trim(current_file),' it = ',it
+    t = dble(it)*dt
+    avec = vector_potential_for_field(t,field_amplitude)
+    norm_squared = real(inner_product(zpsi,zpsi))
+    if (norm_squared <= 0d0) stop 'TDSE state has non-positive norm squared.'
+    call apply_hamiltonian(zpsi,hpsi,avec)
+    energy = real(inner_product(zpsi,hpsi))/norm_squared
+    particle_velocity = total_particle_velocity(zpsi,avec)
+    current_t(it) = charge_current_density(zpsi,avec)
+    write(30,"(999e26.16e3)") t,avec,particle_velocity,current_t(it), &
+        norm_squared,energy
+    if (write_pop .and. modulo(it,output_stride) == 0) then
+      do istate=1,num_eigenstates
+        amplitude(istate)=inner_product(eigenvectors(:,:,:,istate),zpsi)
+        raw_population(istate)=abs(amplitude(istate))**2
+      end do
+      normalized_population=raw_population/norm_squared
+      raw_sum=sum(raw_population)
+      normalized_sum=sum(normalized_population)
+      write(31,"(999e26.16e3)") t,norm_squared, &
+          (real(amplitude(istate)),aimag(amplitude(istate)), &
+          raw_population(istate),normalized_population(istate), &
+          istate=1,num_eigenstates),raw_sum,normalized_sum
+      manifold_population=0d0
+      do istate=1,num_eigenstates
+        imanifold=manifold(istate)
+        manifold_population(imanifold)=manifold_population(imanifold)+ &
+            normalized_population(istate)
+      end do
+      write(32,"(999e26.16e3)") t,norm_squared,manifold_population
+    end if
+    if (it < nt) call rk4_step(t,dt,field_amplitude)
+  end do
+  close(30)
+  if (write_pop) then
+    close(31)
+    close(32)
+  end if
+  deallocate(hpsi,amplitude,raw_population,normalized_population)
+  deallocate(manifold,manifold_population)
 
-end subroutine propagate_tdse
+end subroutine propagate_trajectory
 !-------------------------------------------------------
-subroutine rk4_step(t, h)
+subroutine assign_energy_manifolds(manifold,nmanifolds)
   implicit none
-  real(8),intent(in) :: t, h
+  integer,intent(out) :: manifold(num_eigenstates),nmanifolds
+  integer :: i
+
+  nmanifolds=1
+  manifold(1)=1
+  do i=2,num_eigenstates
+    if (abs(eigenvalues(i)-eigenvalues(i-1)) >= degeneracy_energy_tol) &
+        nmanifolds=nmanifolds+1
+    manifold(i)=nmanifolds
+  end do
+  write(*,'(a,i8,a,i8,a)') 'Grouped ',num_eigenstates,' states into ', &
+      nmanifolds,' manifolds.'
+  do i=1,num_eigenstates
+    write(*,'(a,i4,a,i4)') '  state ',i-1,' -> manifold ',manifold(i)-1
+  end do
+
+end subroutine assign_energy_manifolds
+!-------------------------------------------------------
+subroutine write_second_order_file(filename,field_amplitude,jplus,jminus, &
+    jzero,response)
+  implicit none
+  character(*),intent(in) :: filename
+  real(8),intent(in) :: field_amplitude
+  real(8),intent(in) :: jplus(0:nt),jminus(0:nt),jzero(0:nt)
+  real(8),intent(out) :: response(0:nt)
+  integer :: it
+  real(8) :: t,jeven,jodd,scaled
+
+  open(33,file=filename,status='replace')
+  write(33,'(a)') '# Physical charge current density, atomic units.'
+  write(33,'(a)') '# columns: t J_plus J_minus J_zero J_even'// &
+      ' J_even_induced J_even_induced_over_E0_squared J_odd'
+  do it=0,nt
+    t=dble(it)*dt
+    jeven=0.5d0*(jplus(it)+jminus(it))
+    jodd=0.5d0*(jplus(it)-jminus(it))
+    response(it)=jeven-jzero(it)
+    scaled=0d0
+    if (abs(field_amplitude) > 0d0) scaled=response(it)/field_amplitude**2
+    write(33,"(999e26.16e3)") t,jplus(it),jminus(it),jzero(it), &
+        jeven,response(it),scaled,jodd
+  end do
+  close(33)
+
+end subroutine write_second_order_file
+!-------------------------------------------------------
+subroutine report_zero_field_floor(jzero,response,field_amplitude)
+  implicit none
+  real(8),intent(in) :: jzero(0:nt),response(0:nt),field_amplitude
+  real(8) :: max_zero,rms_zero,max_signal,ratio
+
+  max_zero=maxval(abs(jzero))
+  rms_zero=sqrt(sum(jzero*jzero)/dble(nt+1))
+  max_signal=maxval(abs(response))
+  ratio=huge(1d0)
+  if (max_zero > 0d0) ratio=max_signal/max_zero
+  write(*,'(a)') 'Zero-field numerical-current diagnostic:'
+  write(*,'(a,1pe16.8)') '  max_t |J0(t)| = ',max_zero
+  write(*,'(a,1pe16.8)') '  RMS[J0]       = ',rms_zero
+  write(*,'(a,1pe16.8)') '  max |J_even_induced| = ',max_signal
+  write(*,'(a,1pe16.8)') '  signal / max|J0|     = ',ratio
+  write(*,'(a,1pe16.8)') '  field amplitude used = ',field_amplitude
+  write(*,'(a)') '  This ratio is a numerical-floor diagnostic, not an error bar.'
+
+end subroutine report_zero_field_floor
+!-------------------------------------------------------
+subroutine write_scaling_comparison(response,response_half,field_amplitude)
+  implicit none
+  real(8),intent(in) :: response(0:nt),response_half(0:nt),field_amplitude
+  integer :: it
+  real(8) :: scaled_full,scaled_half,relative_difference,denominator
+  real(8) :: maximum_relative_difference
+
+  open(34,file='second_order_scaling.out',status='replace')
+  write(34,'(a)') '# Compare J_even_induced/E^2 at E0 and E0/2.'
+  write(34,'(a)') '# columns: t scaled_E0 scaled_E0_over_2 relative_difference'
+  maximum_relative_difference=0d0
+  do it=0,nt
+    scaled_full=0d0
+    scaled_half=0d0
+    if (abs(field_amplitude) > 0d0) then
+      scaled_full=response(it)/field_amplitude**2
+      scaled_half=response_half(it)/(0.5d0*field_amplitude)**2
+    end if
+    denominator=max(abs(scaled_full),abs(scaled_half),tiny(1d0))
+    relative_difference=abs(scaled_full-scaled_half)/denominator
+    maximum_relative_difference=max(maximum_relative_difference, &
+        relative_difference)
+    write(34,"(999e26.16e3)") dble(it)*dt,scaled_full,scaled_half, &
+        relative_difference
+  end do
+  close(34)
+  write(*,'(a,1pe16.8)') 'Maximum pointwise second-order scaling difference = ', &
+      maximum_relative_difference
+
+end subroutine write_scaling_comparison
+!-------------------------------------------------------
+subroutine rk4_step(t, h, field_amplitude)
+  implicit none
+  real(8),intent(in) :: t, h, field_amplitude
   complex(8),allocatable :: y0(:,:,:), yt(:,:,:), k1(:,:,:), k2(:,:,:)
   complex(8),allocatable :: k3(:,:,:), k4(:,:,:)
 
@@ -839,16 +1245,16 @@ subroutine rk4_step(t, h)
   allocate(k4(0:nx-1,0:nx-1,0:nx-1))
 
   y0 = zpsi
-  call tdse_rhs(y0, k1, t)
+  call tdse_rhs(y0, k1, t, field_amplitude)
   yt = y0 + 0.5d0*h*k1
   call antisymmetrize(yt)
-  call tdse_rhs(yt, k2, t+0.5d0*h)
+  call tdse_rhs(yt, k2, t+0.5d0*h, field_amplitude)
   yt = y0 + 0.5d0*h*k2
   call antisymmetrize(yt)
-  call tdse_rhs(yt, k3, t+0.5d0*h)
+  call tdse_rhs(yt, k3, t+0.5d0*h, field_amplitude)
   yt = y0 + h*k3
   call antisymmetrize(yt)
-  call tdse_rhs(yt, k4, t+h)
+  call tdse_rhs(yt, k4, t+h, field_amplitude)
 
   zpsi = y0 + h*(k1 + 2d0*k2 + 2d0*k3 + k4)/6d0
   call antisymmetrize(zpsi)
@@ -857,13 +1263,13 @@ subroutine rk4_step(t, h)
 
 end subroutine rk4_step
 !-------------------------------------------------------
-subroutine tdse_rhs(psi, rhs, t)
+subroutine tdse_rhs(psi, rhs, t, field_amplitude)
   implicit none
   complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
   complex(8),intent(out) :: rhs(0:nx-1,0:nx-1,0:nx-1)
-  real(8),intent(in) :: t
+  real(8),intent(in) :: t, field_amplitude
 
-  call apply_hamiltonian(psi, rhs, vector_potential(t))
+  call apply_hamiltonian(psi, rhs, vector_potential_for_field(t,field_amplitude))
   rhs = -zi*rhs
 
 end subroutine tdse_rhs
@@ -871,18 +1277,26 @@ end subroutine tdse_rhs
 real(8) function vector_potential(t)
   implicit none
   real(8),intent(in) :: t
+  vector_potential=vector_potential_for_field(t,E0)
+
+end function vector_potential
+!-------------------------------------------------------
+real(8) function vector_potential_for_field(t,field_amplitude)
+  implicit none
+  real(8),intent(in) :: t,field_amplitude
   real(8) :: env
 
   if (t < 0d0 .or. t > Tpulse) then
-    vector_potential = 0d0
+    vector_potential_for_field = 0d0
   else
     env = sin(pi*t/Tpulse)**4
 ! A(t) is chosen so that the field is approximately E(t)=-dA/dt for a
 ! slowly varying envelope; the exact A(t) is what enters the Hamiltonian.
-    vector_potential = -(E0/omega)*env*sin(omega*(t-0.5d0*tpulse) + phi_CEP)
+    vector_potential_for_field = -(field_amplitude/omega)*env* &
+        sin(omega*(t-0.5d0*tpulse) + phi_CEP)
   end if
 
-end function vector_potential
+end function vector_potential_for_field
 !-------------------------------------------------------
 real(8) function particle_velocity_numerator(psi, avec)
   implicit none
@@ -989,12 +1403,14 @@ end function normalized_energy
 subroutine check_current_operator(psi)
   implicit none
   complex(8),intent(in) :: psi(0:nx-1,0:nx-1,0:nx-1)
-  complex(8),allocatable :: scaled_psi(:,:,:)
+  complex(8),allocatable :: scaled_psi(:,:,:),trial_psi(:,:,:)
   real(8),parameter :: avec_test = 1d-2
   real(8),parameter :: delta_avec = 1d-5
   real(8),parameter :: test_scale = 1.234d0
   real(8) :: derivative_fd, particle_velocity, abs_error, tolerance
   real(8) :: energy_scale_error, current_scale_error
+  real(8) :: trial_derivative_fd,trial_momentum,trial_error,boost_k
+  integer :: ix1,ix2,ix3
 
 ! For a fixed state, central differentiation is exact for the quadratic A
 ! dependence up to floating-point cancellation.  This tests that the current
@@ -1004,9 +1420,10 @@ subroutine check_current_operator(psi)
   particle_velocity = total_particle_velocity(psi,avec_test)
   abs_error = abs(derivative_fd-particle_velocity)
   tolerance = 1d-9*max(1d0,abs(derivative_fd),abs(particle_velocity))
-  write(*,'(a,1pe16.8)') 'Current test d<H>/dA             = ',derivative_fd
-  write(*,'(a,1pe16.8)') 'Current test <sum_i(p_i+A)>      = ',particle_velocity
-  write(*,'(a,1pe16.8)') 'Current-operator test abs. error = ',abs_error
+  write(*,'(a)') 'Ground-state current-operator test at finite A:'
+  write(*,'(a,1pe16.8)') '  d<H>/dA                   = ',derivative_fd
+  write(*,'(a,1pe16.8)') '  <sum_i(p_i+A)>            = ',particle_velocity
+  write(*,'(a,1pe16.8)') '  absolute error            = ',abs_error
   if (abs_error > tolerance) then
     write(*,'(a,1pe16.8)') 'Warning: current-operator test tolerance = ',tolerance
   end if
@@ -1019,9 +1436,41 @@ subroutine check_current_operator(psi)
       - normalized_energy(psi,avec_test))
   current_scale_error = abs(total_particle_velocity(scaled_psi,avec_test) &
       - total_particle_velocity(psi,avec_test))
+
+! A ring-compatible center-of-mass phase preserves both PBC and fermionic
+! antisymmetry while producing a reproducible nonzero canonical momentum.
+  allocate(trial_psi(0:nx-1,0:nx-1,0:nx-1))
+  boost_k=2d0*pi/bvc_lattice_constant
+  do ix1=0,nx-1
+    do ix2=0,nx-1
+      do ix3=0,nx-1
+        trial_psi(ix1,ix2,ix3)=psi(ix1,ix2,ix3)* &
+            exp(zi*boost_k*(xn(ix1)+xn(ix2)+xn(ix3)))
+      end do
+    end do
+  end do
+  call antisymmetrize(trial_psi)
+  call normalize(trial_psi)
+  trial_derivative_fd=(normalized_energy(trial_psi,delta_avec)- &
+      normalized_energy(trial_psi,-delta_avec))/(2d0*delta_avec)
+  trial_momentum=total_particle_velocity(trial_psi,0d0)
+  trial_error=abs(trial_derivative_fd-trial_momentum)
+  tolerance=1d-9*max(1d0,abs(trial_derivative_fd),abs(trial_momentum))
+  write(*,'(a)') 'Nonzero-momentum antisymmetric trial-state test at A=0:'
+  write(*,'(a,1pe16.8)') '  d<H>/dA                   = ',trial_derivative_fd
+  write(*,'(a,1pe16.8)') '  <sum_i p_i>               = ',trial_momentum
+  write(*,'(a,1pe16.8)') '  absolute error            = ',trial_error
+  write(*,'(a,1pe16.8)') '  antisymmetry error        = ', &
+      antisymmetry_error(trial_psi)
+  if (abs(trial_momentum) < 1d-6) then
+    write(*,'(a)') 'Warning: trial-state momentum unexpectedly small.'
+  end if
+  if (trial_error > tolerance) then
+    write(*,'(a,1pe16.8)') 'Warning: trial current-test tolerance = ',tolerance
+  end if
   write(*,'(a,1pe16.8)') 'Norm-scaling test energy error    = ',energy_scale_error
   write(*,'(a,1pe16.8)') 'Norm-scaling test current error   = ',current_scale_error
-  deallocate(scaled_psi)
+  deallocate(scaled_psi,trial_psi)
 
 end subroutine check_current_operator
 !-------------------------------------------------------
@@ -1052,9 +1501,13 @@ subroutine finalize
   if (allocated(zpsi)) deallocate(zpsi)
   if (allocated(eigenvalues)) deallocate(eigenvalues)
   if (allocated(eigenstate_residuals)) deallocate(eigenstate_residuals)
+  if (allocated(eigenstate_iterations)) deallocate(eigenstate_iterations)
+  if (allocated(eigenstate_converged)) deallocate(eigenstate_converged)
   if (allocated(eigenvectors)) deallocate(eigenvectors)
   if (allocated(vpot_1d)) deallocate(vpot_1d)
   if (allocated(wpot_1d)) deallocate(wpot_1d)
+  if (allocated(onebody_values)) deallocate(onebody_values)
+  if (allocated(onebody_vectors)) deallocate(onebody_vectors)
   if (allocated(vpot)) deallocate(vpot)
   if (allocated(wpot)) deallocate(wpot)
   if (allocated(tot_pot)) deallocate(tot_pot)
